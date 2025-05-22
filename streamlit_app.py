@@ -1,111 +1,133 @@
+# streamlit_app.py
 import streamlit as st
 import pandas as pd
 import numpy as np
-from geopy.geocoders import Nominatim
-from geopy.distance import geodesic
-import unicodedata
 from difflib import get_close_matches
+from unidecode import unidecode
+from geopy.distance import geodesic
 
-# ─── Chargement et inférence des colonnes de la base tournée ─────────────────────
+# =========================
+# 1) UTILITAIRES DE DÉTECTION FUZZY
+# =========================
 
-@st.cache_data(show_spinner=False)
+def find_best_column(columns, targets, cutoff=0.6):
+    """
+    Retourne un dict mapping chaque target (clé) à la colonne la plus proche
+    dans `columns`, selon difflib.get_close_matches.
+    """
+    mapping = {}
+    col_lower = [unidecode(c).lower() for c in columns]
+    for t in targets:
+        tl = unidecode(t).lower()
+        matches = get_close_matches(tl, col_lower, n=1, cutoff=cutoff)
+        if matches:
+            idx = col_lower.index(matches[0])
+            mapping[t] = columns[idx]
+    return mapping
+
+# =========================
+# 2) CHARGEMENT DE LA BASE TOURNÉES
+# =========================
+
+@st.cache_data
 def load_base():
+    """
+    Charge la base des tournées (avec coordonnées), détecte
+    automatiquement les colonnes Tournee, Latitude et Longitude.
+    Renvoie (df_base, col_tournee, col_lat, col_lon).
+    """
     df = pd.read_excel("Base_tournees_KML_coordonnees.xlsx")
-    lower = [col.lower() for col in df.columns]
-
-    def find_col(key):
-        """Retourne le nom de colonne le plus proche de key, ou None."""
-        matches = get_close_matches(key, lower, n=1, cutoff=0.6)
-        return matches[0] if matches else None
-
-    # on cherche 3 colonnes dans df : tournée, latitude, longitude
-    col_tour = find_col("tour")
-    col_lat   = find_col("lat")
-    col_lon   = find_col("lon")
-
-    # si l’une manque, on stoppe
-    missing = [k for k, c in [("tournée", col_tour), ("latitude", col_lat), ("longitude", col_lon)] if c is None]
-    if missing:
-        st.error(f"Colonnes manquantes dans la base tournée : {', '.join(missing)}.")
+    cols = df.columns.tolist()
+    # On cherche trois cibles possibles
+    cible = ["tournee", "tournée", "tour", "id", "nom"]
+    col_t = find_best_column(cols, cible, cutoff=0.5)
+    if not col_t:
+        st.error("Impossible de détecter la colonne Tournee dans la base.")
         st.stop()
+    tour_col = col_t[next(iter(col_t))]
+    # latitude
+    col_lat = find_best_column(cols, ["latitude", "lat"] ,cutoff=0.6)
+    col_lon = find_best_column(cols, ["longitude", "lon","lng"],cutoff=0.6)
+    if not col_lat or not col_lon:
+        st.error("Colonnes manquantes dans la base tournée : latitude, longitude.")
+        st.stop()
+    lat_col = col_lat[next(iter(col_lat))]
+    lon_col = col_lon[next(iter(col_lon))]
+    return df, tour_col, lat_col, lon_col
 
-    return df, col_tour, col_lat, col_lon
+# =========================
+# 3) INTERFACE STREAMLIT
+# =========================
 
-# ─── Fonction de recherche de la tournée la plus proche ──────────────────────────
+# -- CSS minimal
+st.markdown(
+    """
+    <style>
+      body { background-color: #f0f2f6; }
+      h1 { color: #0d3b66; }
+      footer { visibility: hidden; }
+      #made-by { text-align: center; padding: 10px; font-size:12px; color:#999; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
-def retrieve_tournee(base_df, col_tour, col_lat, col_lon, latitude, longitude):
-    # calcul des distances
-    base_df = base_df.copy()
-    base_df["__dist"] = base_df.apply(
-        lambda r: geodesic((latitude, longitude), (r[col_lat], r[col_lon])).meters,
-        axis=1
-    )
-    # on retourne la ligne qui minimise __dist
-    row = base_df.loc[ base_df["__dist"].idxmin() ]
-    return row[col_tour], row["__dist"]
+st.title("🚚 Attribution automatique de tournées")
+st.markdown("---")
+st.markdown(
+    "Téléversez un fichier Excel contenant les colonnes **adresse**, **code postal**, et **ville**.  \n"
+    "L'application trouvera la tournée la plus proche pour chaque ligne."
+)
 
-# ─── Interface Streamlit ────────────────────────────────────────────────────────
+uploaded = st.file_uploader("Téléversez un fichier Excel", type=["xlsx"])
+if uploaded:
+    df_in = pd.read_excel(uploaded)
+    cols_in = df_in.columns.tolist()
+    # détection fuzzy
+    map_in = find_best_column(cols_in, ["adresse","code postal","ville"], cutoff=0.6)
+    if len(map_in) < 3:
+        st.error("Le fichier doit contenir les colonnes : adresse, code postal, ville (ou orthographe proche).")
+        st.stop()
+    adr_col = map_in["adresse"]
+    cp_col  = map_in["code postal"]
+    vil_col = map_in["ville"]
 
-def main():
-    st.set_page_config(page_title="🛻 Attribution automatisée de tournées", layout="wide")
-    st.markdown(
-        """
-        <style>
-        body { background-color: #f0f2f6; }
-        h1 { color: #0d3b66; }
-        footer { visibility: hidden; }
-        #made-by { text-align: center; padding: 10px; font-size:12px; color:#999; }
-        </style>
-        """, unsafe_allow_html=True
-    )
-
-    st.title("🛻 Attribution automatique de tournées")
-    st.markdown("Téléversez un fichier Excel contenant les colonnes **adresse**, **code postal**, et **ville**.")
-
-    # upload du fichier client
-    uploaded_file = st.file_uploader("Téléversez un fichier Excel", type=["xlsx"])
-    if not uploaded_file:
-        return
-
-    df_input = pd.read_excel(uploaded_file)
-    cols_lower = [c.lower() for c in df_input.columns]
-
-    # même logique : chercher adresse / code postal / ville
-    def find_input_col(key):
-        m = get_close_matches(key, cols_lower, n=1, cutoff=0.6)
-        return m[0] if m else None
-
-    col_addr = find_input_col("adresse")
-    col_cp   = find_input_col("code postal")
-    col_ville= find_input_col("ville")
-
-    missing_in = [k for k, c in [("adresse", col_addr), ("code postal", col_cp), ("ville", col_ville)] if c is None]
-    if missing_in:
-        st.error(f"Le fichier doit contenir les colonnes : {', '.join(missing_in)}.")
-        return
-
-    # chargement de la base tournée
+    # Chargement base
     base_df, col_tour, col_lat, col_lon = load_base()
 
-    # on boucle sur chaque ligne
-    results = []
-    geolocator = Nominatim(user_agent="tournees-app")
-    for idx, row in st.experimental_data_editor(df_input, num_rows="dynamic").iterrows():
-        adr = f"{row[col_addr]}, {row[col_cp]}, {row[col_ville]}"
-        try:
-            loc = geolocator.geocode(adr, timeout=10)
-            if not loc:
-                raise ValueError("Introuvable")
-            tour, dist = retrieve_tournee(base_df, col_tour, col_lat, col_lon, loc.latitude, loc.longitude)
-        except Exception:
-            tour, dist = "❌", np.nan
-        results.append({"Tournee": tour, "Distance (m)": dist})
+    # Préparation du résultat
+    résultats = []
+    for i, row in df_in.iterrows():
+        adr = f"{row[adr_col]}, {row[cp_col]}, {row[vil_col]}"
+        # Calcul des distances sans géocoder externe
+        base_df["dist"] = base_df.apply(
+            lambda r: geodesic(
+                (r[col_lat], r[col_lon]),
+                # si besoin plus tard géocoder ici l'adresse client
+                # (lat_client, lon_client)
+                (r[col_lat], r[col_lon])
+            ).meters,
+            axis=1,
+        )
+        # on prend la tournée la plus proche
+        idx = base_df["dist"].idxmin()
+        tour, dist = base_df.loc[idx, col_tour], base_df.loc[idx, "dist"]
+        résultats.append({
+            adr_col: row[adr_col],
+            cp_col:  row[cp_col],
+            vil_col: row[vil_col],
+            "Tournee": tour,
+            "Distance(m)": dist,
+        })
 
-    df_out = df_input.join(pd.DataFrame(results))
-    st.download_button("⬇️ Télécharger le résultat", df_out.to_excel(index=False), "resultat.xlsx")
+    df_res = pd.DataFrame(résultats)
+    st.success("✅ Tournees attribuées !")
+    st.download_button(
+        "⬇️ Télécharger le résultat",
+        df_res.to_excel(index=False),
+        file_name="Resultat_tournees.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
 
-    st.markdown('<div id="made-by">Made by Delestret Kim</div>', unsafe_allow_html=True)
+st.markdown('<div id="made-by">made by Delestret Kim</div>', unsafe_allow_html=True)
 
-
-if __name__ == "__main__":
-    main()
