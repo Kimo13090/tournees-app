@@ -1,6 +1,5 @@
-streamlit
-pandas
-geopy
-Unidecode
-fuzzywuzzy
 openpyxl
+unidecode
+geopy
+pandas
+streamlit
