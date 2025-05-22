@@ -1,82 +1,85 @@
-
 import streamlit as st
 import pandas as pd
-import numpy as np
-import pgeocode
-from sklearn.neighbors import BallTree
-from rapidfuzz import fuzz
-import unicodedata
-import difflib
+from geopy.geocoders import Nominatim
+from geopy.distance import geodesic
+from difflib import get_close_matches
 
-# Chargement de la base de tournées
+# --- Chargement de la base tournée (lire votre fichier de tournées + coordonnées) ---
 @st.cache_data
 def load_base():
-    base = pd.read_excel("Base_tournees_KML_coordonnees.xlsx")
-    base["coord"] = np.deg2rad(base[["Latitude", "Longitude"]].values)
-    tree = BallTree(base["coord"].tolist(), metric="haversine")
-    return base, tree
+    # Assurez-vous que ce fichier se trouve à la racine du dépôt
+    return pd.read_excel("Base_tournees_KML_coordonnees.xlsx")
 
-# Tentative de détection intelligente des colonnes
+# --- Détection fuzzy des colonnes utilisateur ---
 def detect_columns(df):
-    targets = {"adresse": ["adresse", "rue", "address"],
-               "code postal": ["cp", "code", "postal"],
-               "ville": ["ville", "commune", "localite"]}
+    lower2orig = {c.lower(): c for c in df.columns}
     mapping = {}
-    for target, keys in targets.items():
-        for col in df.columns:
-            col_clean = unicodedata.normalize("NFKD", col.lower()).encode("ASCII", "ignore").decode()
-            if any(fuzz.partial_ratio(col_clean, key) > 80 for key in keys):
-                mapping[target] = col
-                break
+    for target in ["adresse", "code postal", "ville"]:
+        m = get_close_matches(target, lower2orig.keys(), n=1, cutoff=0.6)
+        if m:
+            mapping[target] = lower2orig[m[0]]
     return mapping
 
-# Récupération des coordonnées centrées sur le code postal
-def get_postal_centroid(cp_series):
-    nomi = pgeocode.Nominatim("fr")
-    lat = nomi.query_postal_code(cp_series.astype(str)).latitude.fillna(0).values
-    lon = nomi.query_postal_code(cp_series.astype(str)).longitude.fillna(0).values
-    return np.deg2rad(np.vstack([lat, lon]).T)
+# --- Recherche de la tournée la plus proche via géodésie ---
+def retrieve_tournee(base_df, lat, lon):
+    # on suppose que base_df contient les colonnes "Tournee", "Lat", "Lon"
+    distances = base_df.apply(
+        lambda r: geodesic((lat, lon), (r["Lat"], r["Lon"])).meters, axis=1
+    )
+    idx = distances.idxmin()
+    return base_df.loc[idx, "Tournee"]
 
-# Attribution de tournée
-def assign_tournees(df_input, base_df, tree):
-    pts = get_postal_centroid(df_input["code postal"])
-    dist, ind = tree.query(pts, k=1)
-    df_input["Tournee"] = base_df.iloc[ind[:,0]]["Tournee"].values
-    df_input["Distance (km)"] = (dist[:,0] * 6371).round(2)
-    return df_input
+def main():
+    st.set_page_config(page_title="Attribution tournées", layout="wide")
+    st.title("🚚 Attribution automatique de tournées")
+    st.markdown("""
+Téléversez un fichier Excel contenant les colonnes **adresse**, **code postal**, et **ville**.  
+L'application tentera de retrouver automatiquement la tournée correspondante pour chaque ligne.
+""")
 
-# --- UI ---
-st.markdown("""
-    <style>
-    body { background-color: #f0f2f6; }
-    h1 { color: #0d3b66; }
-    footer {visibility: hidden;}
-    #made-by { text-align: center; padding: 10px; font-size:12px; color:#999; }
-    </style>
-    """, unsafe_allow_html=True)
+    uploaded_file = st.file_uploader("Téléversez un fichier Excel", type=["xlsx"])
+    if not uploaded_file:
+        return
 
-st.title("🚚 Attribution automatique de tournées")
-st.markdown("Téléversez un fichier Excel contenant les colonnes **adresse**, **code postal**, et **ville**.
-
-L'application tentera de retrouver automatiquement la tournée correspondante pour chaque ligne.")
-
-uploaded_file = st.file_uploader("Téléversez un fichier Excel", type=["xlsx"])
-
-if uploaded_file:
+    # Lecture du fichier utilisateur
     df_input = pd.read_excel(uploaded_file)
     col_map = detect_columns(df_input)
-
     if len(col_map) < 3:
-        st.error("Le fichier doit contenir les colonnes : adresse, code postal, ville (ou noms similaires).")
-    else:
-        df_input.rename(columns=col_map, inplace=True)
-        base_df, tree = load_base()
-        df_out = assign_tournees(df_input, base_df, tree)
-        st.success("Tournées attribuées avec succès ✅")
-        st.dataframe(df_out)
+        st.error("Le fichier doit contenir les colonnes : adresse, code postal, ville (ou équivalents).")
+        return
 
-        st.download_button("📥 Télécharger le fichier avec tournées",
-                           data=df_out.to_excel(index=False),
-                           file_name="resultat_tournees.xlsx")
+    # Chargement de la base tournée
+    base = load_base()
+    geolocator = Nominatim(user_agent="tournees-app", timeout=10)
 
-st.markdown('<div id="made-by">Made by Delestret Kim</div>', unsafe_allow_html=True)
+    # Traitement ligne à ligne
+    tours = []
+    for _, row in df_input.iterrows():
+        query = (
+            f"{row[col_map['adresse']]}, "
+            f"{row[col_map['code postal']]}, "
+            f"{row[col_map['ville']]}"
+        )
+        loc = geolocator.geocode(query)
+        if loc:
+            tour = retrieve_tournee(base, loc.latitude, loc.longitude)
+        else:
+            tour = "Non trouvé"
+        tours.append(tour)
+
+    # Ajout et téléchargement
+    df_input["Tournée"] = tours
+    towrite = pd.ExcelWriter("resultats.xlsx", engine="openpyxl")
+    df_input.to_excel(towrite, index=False)
+    towrite.close()
+
+    st.success("Attribution terminée ! Téléchargez le fichier ci-dessous.")
+    with open("resultats.xlsx", "rb") as f:
+        st.download_button(
+            label="📥 Télécharger les résultats",
+            data=f,
+            file_name="resultats.xlsx"
+        )
+
+if __name__ == "__main__":
+    main()
