@@ -4,82 +4,87 @@ from geopy.geocoders import Nominatim
 from geopy.distance import geodesic
 from difflib import get_close_matches
 
-# --- Chargement de la base tournée (lire votre fichier de tournées + coordonnées) ---
+# --- Charge et détecte les colonnes de la base tournée ---
 @st.cache_data
 def load_base():
-    # Assurez-vous que ce fichier se trouve à la racine du dépôt
-    return pd.read_excel("Base_tournees_KML_coordonnees.xlsx")
+    df = pd.read_excel("Base_tournees_KML_coordonnees.xlsx")
+    # détection fuzzy pour « tournée », « latitude », « longitude »
+    lower = {c.lower(): c for c in df.columns}
+    col_tournee = lower[get_close_matches("tournee", lower, n=1, cutoff=0.6)[0]]
+    col_lat = lower[get_close_matches("lat", lower, n=1, cutoff=0.6)[0]]
+    col_lon = lower[get_close_matches("lon", lower, n=1, cutoff=0.6)[0]]
+    return df, col_tournee, col_lat, col_lon
 
-# --- Détection fuzzy des colonnes utilisateur ---
-def detect_columns(df):
-    lower2orig = {c.lower(): c for c in df.columns}
+# --- Détecte fuzzy les colonnes du fichier client ---
+def detect_input_columns(df):
+    lower = {c.lower(): c for c in df.columns}
     mapping = {}
-    for target in ["adresse", "code postal", "ville"]:
-        m = get_close_matches(target, lower2orig.keys(), n=1, cutoff=0.6)
+    for target in ("adresse", "code postal", "ville"):
+        m = get_close_matches(target, lower, n=1, cutoff=0.6)
         if m:
-            mapping[target] = lower2orig[m[0]]
+            mapping[target] = lower[m[0]]
     return mapping
 
-# --- Recherche de la tournée la plus proche via géodésie ---
-def retrieve_tournee(base_df, lat, lon):
-    # on suppose que base_df contient les colonnes "Tournee", "Lat", "Lon"
-    distances = base_df.apply(
-        lambda r: geodesic((lat, lon), (r["Lat"], r["Lon"])).meters, axis=1
-    )
-    idx = distances.idxmin()
-    return base_df.loc[idx, "Tournee"]
+# --- Recherche de tournée la plus proche ---
+def retrieve_tournee(base_df, col_tour, col_lat, col_lon, lat, lon):
+    # calcule la distance à chaque point de la base
+    dists = base_df.apply(
+        lambda r: geodesic((lat, lon), (r[col_lat], r[col_lon])).meters,
+        axis=1)
+    idx = dists.idxmin()
+    return base_df.loc[idx, col_tour]
 
 def main():
     st.set_page_config(page_title="Attribution tournées", layout="wide")
     st.title("🚚 Attribution automatique de tournées")
+
     st.markdown("""
-Téléversez un fichier Excel contenant les colonnes **adresse**, **code postal**, et **ville**.  
-L'application tentera de retrouver automatiquement la tournée correspondante pour chaque ligne.
+Téléversez un fichier Excel contenant les colonnes **adresse**,  
+**code postal** et **ville** (ou équivalents).  
+L'application cherchera la tournée la plus proche pour chaque ligne.
 """)
 
-    uploaded_file = st.file_uploader("Téléversez un fichier Excel", type=["xlsx"])
-    if not uploaded_file:
+    uploaded = st.file_uploader("Votre fichier client", type=["xlsx"])
+    if not uploaded:
         return
 
-    # Lecture du fichier utilisateur
-    df_input = pd.read_excel(uploaded_file)
-    col_map = detect_columns(df_input)
+    # lit le fichier client
+    df_in = pd.read_excel(uploaded)
+    col_map = detect_input_columns(df_in)
     if len(col_map) < 3:
-        st.error("Le fichier doit contenir les colonnes : adresse, code postal, ville (ou équivalents).")
+        st.error("Votre fichier doit contenir adresse, code postal et ville.")
         return
 
-    # Chargement de la base tournée
-    base = load_base()
-    geolocator = Nominatim(user_agent="tournees-app", timeout=10)
+    # charge la base tournée et ses noms de colonnes
+    base_df, col_tour, col_lat, col_lon = load_base()
 
-    # Traitement ligne à ligne
+    # instancie le géocodeur
+    geoloc = Nominatim(user_agent="tournees-app", timeout=10)
+
+    # boucle de traitement
     tours = []
-    for _, row in df_input.iterrows():
-        query = (
+    for _, row in df_in.iterrows():
+        q = (
             f"{row[col_map['adresse']]}, "
             f"{row[col_map['code postal']]}, "
             f"{row[col_map['ville']]}"
         )
-        loc = geolocator.geocode(query)
+        loc = geoloc.geocode(q)
         if loc:
-            tour = retrieve_tournee(base, loc.latitude, loc.longitude)
+            tour = retrieve_tournee(base_df, col_tour, col_lat, col_lon,
+                                     loc.latitude, loc.longitude)
         else:
             tour = "Non trouvé"
         tours.append(tour)
 
-    # Ajout et téléchargement
-    df_input["Tournée"] = tours
-    towrite = pd.ExcelWriter("resultats.xlsx", engine="openpyxl")
-    df_input.to_excel(towrite, index=False)
-    towrite.close()
+    # ajoute la colonne et propose le téléchargement
+    df_in["Tournée"] = tours
+    with pd.ExcelWriter("resultats.xlsx", engine="openpyxl") as w:
+        df_in.to_excel(w, index=False)
 
-    st.success("Attribution terminée ! Téléchargez le fichier ci-dessous.")
+    st.success("Terminé ! Téléchargez vos résultats ci-dessous.")
     with open("resultats.xlsx", "rb") as f:
-        st.download_button(
-            label="📥 Télécharger les résultats",
-            data=f,
-            file_name="resultats.xlsx"
-        )
+        st.download_button("📥 Télécharger", f, "resultats.xlsx")
 
 if __name__ == "__main__":
     main()
