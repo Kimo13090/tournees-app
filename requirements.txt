@@ -1,6 +1,7 @@
 streamlit
 pandas
-geopy
 numpy
+scikit-learn
+pgeocode
+rapidfuzz
 openpyxl
-
