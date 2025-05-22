@@ -1,79 +1,67 @@
 import streamlit as st
 import pandas as pd
+from geopy.geocoders import Nominatim
 from geopy.distance import geodesic
+import unicodedata
 
-# Chargement des bases
+# Détection automatique des colonnes utiles
+def detect_columns_auto(df):
+    columns = {col: normalize(col) for col in df.columns}
+    adresse_col = next((col for col, norm in columns.items() if "adresse" in norm), None)
+    postal_col = next((col for col, norm in columns.items() if "codepostal" in norm or "cp" == norm), None)
+    ville_col = next((col for col, norm in columns.items() if "ville" in norm), None)
+    return adresse_col, postal_col, ville_col
+
+def normalize(text):
+    text = str(text).lower()
+    text = unicodedata.normalize('NFKD', text).encode('ascii', 'ignore').decode('utf-8')
+    return text.replace(" ", "").replace("_", "")
+
 @st.cache_data
 def load_data():
-    base = pd.read_excel("Base_tournees_KML_coordonnees.xlsx")
-    return base
+    return pd.read_excel("Base_tournees_KML_coordonnees.xlsx")
 
-# Détection intelligente des colonnes
-@st.cache_data
-def detect_columns(df):
-    col_map = {}
-    for col in df.columns:
-        col_lower = col.lower()
-        if "adresse" in col_lower and "e-mail" not in col_lower:
-            col_map["adresse"] = col
-        elif "code postal" in col_lower:
-            col_map["code postal"] = col
-        elif "ville" in col_lower:
-            col_map["ville"] = col
-    return col_map
-
-# Fonction de recherche de la tournée
 def retrouver_tournee(base, latitude, longitude):
     base["distance"] = base.apply(
         lambda row: geodesic((latitude, longitude), (row["Latitude"], row["Longitude"])).meters,
         axis=1
     )
-    resultat = base.loc[base["distance"].idxmin()]
-    return resultat["Tournee"], resultat["distance"]
+    result = base.loc[base["distance"].idxmin()]
+    return result["Tournee"], result["distance"]
 
-# Interface Streamlit
-st.title("🚚 Attribution automatique de tournées")
-
+# Interface utilisateur
+st.title("🚛 Attribution automatique de tournées")
 st.markdown("""
-Téléversez un fichier Excel contenant les colonnes **adresse**, **code postal**, et **ville**.
-L'application tentera de retrouver automatiquement la tournée correspondante pour chaque ligne.
+Téléversez un fichier Excel contenant des adresses.
+L'application retrouvera automatiquement la tournée correspondante.
 """)
 
 uploaded_file = st.file_uploader("Téléversez un fichier Excel", type=["xlsx"])
 
 if uploaded_file:
-    df_input = pd.read_excel(uploaded_file)
-    col_map = detect_columns(df_input)
+    df = pd.read_excel(uploaded_file)
+    adresse_col, postal_col, ville_col = detect_columns_auto(df)
 
-    if len(col_map) < 3:
-        st.error("Le fichier doit contenir les colonnes : adresse, code postal, ville (ou noms similaires).")
+    if not all([adresse_col, postal_col, ville_col]):
+        st.error("Colonnes adresse/code postal/ville non détectées automatiquement. Merci de vérifier votre fichier.")
     else:
-        base = load_data()
-
-        from geopy.geocoders import Nominatim
+        base_coords = load_data()
         geolocator = Nominatim(user_agent="tournees-app")
 
-        coordonnees = []
-        for idx, row in df_input.iterrows():
-            adresse_complete = f"{row[col_map['adresse']]}, {row[col_map['code postal']]}, {row[col_map['ville']]}"
+        resultats = []
+        for idx, row in df.iterrows():
+            adresse_complete = f"{row[adresse_col]}, {row[postal_col]} {row[ville_col]}"
             try:
                 location = geolocator.geocode(adresse_complete)
                 if location:
-                    tournee, distance = retrouver_tournee(base, location.latitude, location.longitude)
+                    tournee, distance = retrouver_tournee(base_coords, location.latitude, location.longitude)
                 else:
                     tournee, distance = "Non trouvé", None
             except:
                 tournee, distance = "Erreur", None
-            coordonnees.append((tournee, distance))
+            resultats.append((adresse_complete, tournee, distance))
 
-        df_input["Tournee"] = [t for t, _ in coordonnees]
-        df_input["Distance (m)"] = [d if d else "" for _, d in coordonnees]
-
-        st.success("🎉 Attribution terminée !")
-        st.dataframe(df_input)
-
-        # Téléchargement du résultat
-        from io import BytesIO
-        output = BytesIO()
-        df_input.to_excel(output, index=False)
-        st.download_button("🔗 Télécharger le fichier résultat", output.getvalue(), file_name="resultat_tournees.xlsx")
+        resultat_df = pd.DataFrame(resultats, columns=["Adresse complète", "Tournée attribuée", "Distance (m)"])
+        st.success("Traitement terminé.")
+        st.dataframe(resultat_df)
+        st.download_button("🔹 Télécharger le résultat", resultat_df.to_csv(index=False).encode('utf-8'), file_name="resultat_tournees.csv", mime="text/csv")
