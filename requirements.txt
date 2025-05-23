@@ -1,5 +1,4 @@
-openpyxl
-unidecode
-geopy
-pandas
 streamlit
+pandas
+requests
+openpyxl
