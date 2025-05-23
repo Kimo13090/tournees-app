@@ -5,7 +5,7 @@ import time
 from math import radians, sin, cos, sqrt, atan2
 
 # --- Configuration ---
-USER_AGENT = "TourneeLocator/1.0 (ton_email@domaine.com)"
+USER_AGENT = "TourneeLocator/1.0 (contact@votredomaine.com)"
 
 # --- Fonctions utilitaires ---
 def distance_haversine(lat1, lon1, lat2, lon2):
@@ -13,17 +13,13 @@ def distance_haversine(lat1, lon1, lat2, lon2):
     dlat = radians(lat2 - lat1)
     dlon = radians(lon2 - lon1)
     a = sin(dlat/2)**2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon/2)**2
-    c = 2 * atan2(sqrt(a), sqrt(1-a))
+    c = 2 * atan2(sqrt(a), sqrt(1 - a))
     return R * c
 
 @st.cache_data
 def load_tournees():
-    # Charge la base des tournées (xlsx ou csv)
-    try:
-        df = pd.read_excel("Base_tournees_KML_coordonnees.xlsx")
-    except FileNotFoundError:
-        df = pd.read_csv("Base_tournees_KML_coordonnees.csv")
-    return df
+    # Charge la base de référence des tournées (avec Lat/Lon)
+    return pd.read_excel("Base_tournees_KML_coordonnees.xlsx")
 
 @st.cache_data
 def geocode(address):
@@ -36,83 +32,82 @@ def geocode(address):
         return float(data["lat"]), float(data["lon"])
     return None, None
 
-# --- Application Streamlit ---
+# --- App principale ---
 def main():
     st.title("Attribution Automatique des Tournées")
-    st.write("Upload un fichier Excel/CSV, l'app détecte vos colonnes et attribue la tournée la plus proche ou par zone existante.")
+    st.write("Téléversez un fichier clients (Excel/CSV) et sélectionnez vos colonnes d'adresse, code postal et ville.")
 
-    # Téléversement
     uploaded = st.file_uploader("Fichier Excel/CSV", type=["xlsx", "xls", "csv"])
     if not uploaded:
+        st.info("En attente de fichier...")
         return
 
-    # Lecture brute pour normalisation de header
-    df_raw = pd.read_excel(uploaded, header=None)
-    header_row = 0
-    for idx, row in df_raw.iterrows():
-        if row.str.contains('adresse', case=False, na=False).any():
-            header_row = idx
-            break
-    df_clients = pd.read_excel(uploaded, header=header_row)
+    # Lecture du fichier
+    if uploaded.name.lower().endswith((".xlsx", ".xls")):
+        df = pd.read_excel(uploaded)
+    else:
+        df = pd.read_csv(uploaded)
 
-    st.write("Colonnes détectées :", list(df_clients.columns))
+    st.write("**Colonnes détectées :**", df.columns.tolist())
+
+    # Sélection interactive des colonnes
+    addr_cols = st.multiselect(
+        "Colonnes d'adresse (plusieurs possibles)",
+        df.columns.tolist(),
+        default=[c for c in df.columns if any(k in c.lower() for k in ['voie','rue','chemin','addr','avenue','av','bd','lotissement','impasse','résidence','residence'])]
+    )
+    cp_col = st.selectbox("Colonne Code Postal", [""] + df.columns.tolist())
+    ville_col = st.selectbox("Colonne Ville", [""] + df.columns.tolist())
+
+    if not addr_cols:
+        st.error("Veuillez sélectionner au moins une colonne d'adresse.")
+        return
+
+    # Construction de l'adresse complète
+    full_addr = df[addr_cols].astype(str).agg(' '.join, axis=1)
+    if cp_col:
+        full_addr += ' ' + df[cp_col].astype(str)
+    if ville_col:
+        full_addr += ' ' + df[ville_col].astype(str)
+    df['_full_address'] = full_addr
+
+    # Géocodage
+    lats, lons = [], []
+    for address in df['_full_address']:
+        lat, lon = geocode(address)
+        lats.append(lat)
+        lons.append(lon)
+        time.sleep(1)  # Respect fair-use de Nominatim
+    df['Latitude'] = lats
+    df['Longitude'] = lons
 
     # Chargement des tournées
     df_tournees = load_tournees()
 
-    # Si la colonne 'Zone' existe, on fait un simple merge
-    if 'Zone' in df_clients.columns:
-        df_result = df_clients.merge(
-            df_tournees[['Zone','Tournée']],
-            on='Zone', how='left', suffixes=('','_attribuee')
-        )
-        df_result['Tournée attribuée'] = df_result.get('Tournée_attribuee', df_result.get('Tournée'))
-    else:
-        # Mapping dynamique des champs pour concat adresse
-        cols_map = {col.lower().strip().replace(" ", ""): col for col in df_clients.columns}
-        addr_col = cols_map.get('adresse') or cols_map.get('adressecomplète') or ''
-        comp_col = cols_map.get('complementdadresse') or cols_map.get('complémentdadresse') or ''
-        cp_col = cols_map.get('codepostal') or cols_map.get('cp') or ''
-        ville_col = cols_map.get('ville') or ''
+    # Attribution de la tournée la plus proche
+    assigned = []
+    for _, client in df.iterrows():
+        best = (None, float('inf'))
+        if pd.notna(client['Latitude']) and pd.notna(client['Longitude']):
+            for _, tour in df_tournees.iterrows():
+                d = distance_haversine(
+                    client['Latitude'], client['Longitude'],
+                    tour['Latitude'], tour['Longitude']
+                )
+                if d < best[1]:
+                    best = (tour['Tournée'], d)
+        assigned.append(best[0] if best[0] else 'Non trouvé')
+    df['Tournée attribuée'] = assigned
 
-        # Création de l'adresse complète
-        parts = []
-        for key in (addr_col, comp_col, cp_col, ville_col):
-            if key and key in df_clients.columns:
-                parts.append(df_clients[key].fillna('').astype(str))
-            else:
-                parts.append(pd.Series(['']*len(df_clients)))
-        df_clients['_full_address'] = parts[0] + ' ' + parts[1] + ' ' + parts[2] + ' ' + parts[3]
-
-        # Géocodage
-        lats, lons = [], []
-        for addr in df_clients['_full_address']:
-            lat, lon = geocode(addr)
-            lats.append(lat); lons.append(lon)
-            time.sleep(1)
-        df_clients['Latitude'] = lats
-        df_clients['Longitude'] = lons
-
-        # Attribution par plus proche
-        assigned = []
-        for _, client in df_clients.iterrows():
-            best = (None, float('inf'))
-            if pd.notna(client['Latitude']) and pd.notna(client['Longitude']):
-                #Limiter à la zone si ville/CP dispo
-                zone_val = client.get('Ville') or client.get('Code Postal') or None
-                subset = df_tournees
-                if zone_val and 'Zone' in df_tournees.columns:
-                    subset = df_tournees[df_tournees['Zone'] == zone_val]
-                for _, tour in subset.iterrows():
-                    d = distance_haversine(client['Latitude'], client['Longitude'], tour['Latitude'], tour['Longitude'])
-                    if d < best[1]: best = (tour['Tournée'], d)
-            assigned.append(best[0] or 'Non trouvé')
-        df_clients['Tournée attribuée'] = assigned
-        df_result = df_clients
-
-    st.dataframe(df_result)
-    csv = df_result.to_csv(index=False).encode('utf-8')
-    st.download_button("Télécharger le fichier enrichi", csv, "clients_tournees.csv", "text/csv")
+    # Affichage et téléchargement
+    st.dataframe(df)
+    csv = df.to_csv(index=False).encode('utf-8')
+    st.download_button(
+        "Télécharger le fichier enrichi",
+        csv,
+        "clients_tournees_attribues.csv",
+        "text/csv"
+    )
 
 if __name__ == '__main__':
     main()
