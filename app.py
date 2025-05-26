@@ -9,159 +9,124 @@ from math import radians, sin, cos, sqrt, atan2
 USER_AGENT = "TourneeLocator/1.0 (contact@votredomaine.com)"
 TOURNEES_FILE = "Base_tournees_KML_coordonnees.xlsx"
 
-# --- Fonctions utilitaires ---
 def distance_haversine(lat1, lon1, lat2, lon2):
-    """Calcule la distance en km entre deux points GPS."""
     R = 6371
     dlat = radians(lat2 - lat1)
     dlon = radians(lon2 - lon1)
-    a = sin(dlat/2)**2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon/2)**2
-    c = 2 * atan2(sqrt(a), sqrt(1 - a))
+    a = sin(dlat/2)**2 + cos(radians(lat1))*cos(radians(lat2))*sin(dlon/2)**2
+    c = 2 * atan2(sqrt(a), sqrt(1-a))
     return R * c
 
-@st.cache_data
-def load_tournees_radii():
-    """
-    Charge la base des tournées et calcule pour chaque tournée
-    le centroïde GPS et un rayon robuste (90e percentile des distances).
-    Retourne un dict : tourn_e -> (centroid_lat, centroid_lon, radius_km).
-    """
-    df = pd.read_excel(TOURNEES_FILE)
-    # Grouper par nom de tournée
-    radii = {}
-    for name, grp in df.groupby('Tournée'):
-        lats = grp['Latitude'].astype(float).tolist()
-        lons = grp['Longitude'].astype(float).tolist()
-        # centroïde
-        cent_lat = sum(lats) / len(lats)
-        cent_lon = sum(lons) / len(lons)
-        # distances au centroïde
-        dists = [distance_haversine(cent_lat, cent_lon, lat, lon) for lat, lon in zip(lats, lons)]
-        # rayon = 90e percentile
-        radius = pd.Series(dists).quantile(0.9)
-        radii[name] = (cent_lat, cent_lon, radius)
-    return radii
-
-@st.cache_data
-def geocode(address: str):  # cache pour ne pas surcharger le service
-    """Géocode une adresse via Nominatim, retourne (lat, lon) ou (None,None)."""
-    url = "https://nominatim.openstreetmap.org/search"
-    params = {"q": address, "format": "json", "limit": 1}
-    headers = {"User-Agent": USER_AGENT}
-    try:
-        resp = requests.get(url, params=params, headers=headers, timeout=5)
-        if resp.status_code == 200 and resp.json():
-            d = resp.json()[0]
-            return float(d['lat']), float(d['lon'])
-    except Exception:
-        pass
-    return None, None
-
-# nettoyage avancé
 def clean_address(addr: str) -> str:
-    # supprimer doublons consécutifs
+    # Supprime tokens doublon et remplace abréviations courantes
     tokens = addr.split()
     cleaned = []
     prev = None
     for t in tokens:
+        t_low = t.lower()
+        # abréviations
+        if t_low in ("bd", "boul", "bld"): t = "boulevard"
+        elif t_low in ("av", "av.", "aven"): t = "avenue"
+        elif t_low in ("res", "res."): t = "résidence"
+        # supprimer doublons consécutifs
         if t.lower() != prev:
             cleaned.append(t)
         prev = t.lower()
-    s = ' '.join(cleaned)
-    # remplacer abréviations courantes
-    repl = {' bd ': ' boulevard ', ' av ': ' avenue ', ' res ': ' résidence ',
-            ' rte ': ' route ', ' ch ': ' chemin '}
-    for k, v in repl.items():
-        s = s.replace(k, v)
-    return s
+    return " ".join(cleaned)
 
-# --- Application Streamlit ---
+def geocode(address: str):
+    for variant in (address, clean_address(address)):
+        url = "https://nominatim.openstreetmap.org/search"
+        params = {"q": variant, "format": "json", "limit": 1}
+        headers = {"User-Agent": USER_AGENT}
+        resp = requests.get(url, params=params, headers=headers)
+        if resp.status_code == 200 and resp.json():
+            d = resp.json()[0]
+            return float(d["lat"]), float(d["lon"])
+        time.sleep(1)
+    return None, None
+
+@st.cache_data
+def load_tournees():
+    df = pd.read_excel(TOURNEES_FILE)
+    # Calcul centre et rayon 90e percentile
+    tourns = {}
+    for name, group in df.groupby("Tournée"):
+        lats = group["Latitude"].tolist()
+        lons = group["Longitude"].tolist()
+        centro_lat = sum(lats)/len(lats)
+        centro_lon = sum(lons)/len(lons)
+        # distances
+        dists = [distance_haversine(centro_lat, centro_lon, lat, lon)
+                 for lat, lon in zip(lats, lons)]
+        rayon = pd.Series(dists).quantile(0.9)
+        tourns[name] = {"centro": (centro_lat, centro_lon), "rayon": rayon}
+    return tourns
+
 def main():
     st.title("Attribution Automatique des Tournées PACA")
-    st.write("Upload un fichier clients (Adresse, CP, Ville...). L'app géocode, assigne la tournée la plus proche ou marque HZ hors zone.")
+    st.write("Upload ton fichier clients (Adresse, CP, Ville…); l'app géocode et associe chaque client à sa tournée, ou marque HZ si hors zone.")
 
-    uploaded = st.file_uploader("Fichier Excel/CSV", type=["xlsx", "xls", "csv"])
+    uploaded = st.file_uploader("Fichier Excel/CSV", type=["xlsx","xls","csv"])
     if not uploaded:
         return
 
-    # détection automatique de l'en-tête
-    # on lit sans header pour trouver ligne contenant Adresse/Code Postal/Ville
-    tmp = pd.read_excel(uploaded, header=None, nrows=10)
+    # 1) Lecture et détection de l'en-tête
+    raw = pd.read_excel(uploaded, header=None)
     header_idx = 0
-    for i, row in tmp.iterrows():
-        keys = ''.join(map(str, row.values)).lower()
-        if 'adresse' in keys or 'voie' in keys or 'rue' in keys or 'code' in keys and 'postal' in keys or 'ville' in keys:
+    for i, row in raw.iterrows():
+        combined = " ".join([str(x) for x in row.tolist()]).lower()
+        if any(k in combined for k in ("adresse", "cp", "code postal", "ville")):
             header_idx = i
             break
-    # relire avec ce header
-    if uploaded.name.lower().endswith(('.xls', '.xlsx')):
-        df = pd.read_excel(uploaded, header=header_idx)
-    else:
-        df = pd.read_csv(uploaded, header=header_idx)
+    df_clients = pd.read_excel(uploaded, header=header_idx)
 
-    # repérer les colonnes adresse, cp, ville
-    cols = [c for c in df.columns if isinstance(c, str)]
-    adresse_cols = [c for c in cols if any(k in c.lower() for k in ['adresse', 'voie', 'rue', 'chemin', 'route', 'av', 'bd', 'res'])]
-    cp_cols = [c for c in cols if 'code postal' in c.lower() or c.lower() == 'cp']
-    ville_cols = [c for c in cols if 'ville' in c.lower()]
+    st.write("Colonnes détectées :", list(df_clients.columns))
 
-    # UI de sélection en cas de plusieurs
-    adresse_sel = st.selectbox('Colonne Adresse principale', adresse_cols, index=0 if adresse_cols else None)
-    cp_sel = st.selectbox('Colonne Code Postal', cp_cols, index=0 if cp_cols else None)
-    ville_sel = st.selectbox('Colonne Ville', ville_cols, index=0 if ville_cols else None)
+    # 2) Concaténation de adresses
+    # On recherche automatiquement les colonnes
+    cols = [c.lower().replace(" ", "") for c in df_clients.columns]
+    addr_cols = [c for c in df_clients.columns if "adresse" in c.lower() or "voie" in c.lower() or "rue" in c.lower() or "route" in c.lower()]
+    cp_col = next((c for c in df_clients.columns if "codepostal" in c.lower() or "cp"==c.lower()), "")
+    ville_col = next((c for c in df_clients.columns if "ville" in c.lower()), "")
 
-    # créer _full_address
-    df['_full_address'] = (
-        df[adresse_sel].fillna('').astype(str) + ' ' +
-        df[cp_sel].fillna('').astype(str) + ' ' +
-        df[ville_sel].fillna('').astype(str)
-    ).str.strip()
+    df_clients["_full_address"] = ""
+    for c in addr_cols + ([cp_col] if cp_col else []) + ([ville_col] if ville_col else []):
+        df_clients["_full_address"] += df_clients[c].fillna("").astype(str) + " "
 
-    # nettoyage et géocodage
+    # 3) Géocodage
     lats, lons = [], []
-    for addr in df['_full_address']:
+    for addr in df_clients["_full_address"]:
         lat, lon = geocode(addr)
-        if lat is None:
-            # essayer nettoyage
-            addr2 = clean_address(addr)
-            lat, lon = geocode(addr2)
-        lats.append(lat)
-        lons.append(lon)
-        time.sleep(1)
-    df['Latitude'] = lats
-    df['Longitude'] = lons
+        lats.append(lat); lons.append(lon)
+    df_clients["Latitude"] = lats
+    df_clients["Longitude"] = lons
 
-    # charger tournées et radii
-    radii = load_tournees_radii()
-
-    # attribution tournée ou HZ
-    tours, dists = [], []
-    for _, row in df.iterrows():
-        latc, lonc = row['Latitude'], row['Longitude']
-        best = (None, float('inf'))
-        for tourn, (clat, clon, rad) in radii.items():
+    # 4) Attribution robuste
+    tourns = load_tournees()
+    attribs, dists = [], []
+    for _, row in df_clients.iterrows():
+        latc, lonc = row["Latitude"], row["Longitude"]
+        best_name, best_dist = None, float("inf")
+        for name, info in tourns.items():
+            centro = info["centro"]; rayon = info["rayon"]
             if pd.notna(latc) and pd.notna(lonc):
-                d = distance_haversine(latc, lonc, clat, clon)
-                # ne considérer que si dans le rayon robuste
-                if d <= rad and d < best[1]:
-                    best = (tourn, d)
-        tours.append(best[0] or 'HZ')
-        dists.append(best[1] if best[0] else None)
-    df['Tournée attribuée'] = tours
-    df['Distance (km)'] = dists
+                d = distance_haversine(latc, lonc, centro[0], centro[1])
+                if d <= rayon and d < best_dist:
+                    best_name, best_dist = name, d
+        attribs.append(best_name or "HZ")
+        dists.append(round(best_dist, 2) if best_name else None)
+    df_clients["Tournée attribuée"] = attribs
+    df_clients["Distance (km)"] = dists
 
-    # afficher et proposer téléchargement Excel
-    st.dataframe(df)
+    # 5) Télécharger en Excel
+    to_export = df_clients
     buffer = io.BytesIO()
-    with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-        df.to_excel(writer, index=False, sheet_name='Clients')
-    buffer.seek(0)
-    st.download_button(
-        label='Télécharger le fichier Excel',
-        data=buffer,
-        file_name='clients_tournees.xlsx',
-        mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-    )
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        to_export.to_excel(writer, index=False)
+    st.download_button("Télécharger le fichier enrichi (.xlsx)", buffer.getvalue(),
+                       file_name="clients_tournees_enrichi.xlsx",
+                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
