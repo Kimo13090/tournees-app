@@ -15,143 +15,152 @@ def distance_haversine(lat1, lon1, lat2, lon2):
     dlat = radians(lat2 - lat1)
     dlon = radians(lon2 - lon1)
     a = sin(dlat/2)**2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon/2)**2
-    c = 2 * atan2(sqrt(a), sqrt(1 - a))
+    c = 2 * atan2(sqrt(a), sqrt(1-a))
     return R * c
 
 
 def clean_address(addr: str) -> str:
-    """Supprime les tokens consécutifs identiques et nettoie l'adresse."""
+    """Nettoie et normalise une adresse pour améliorer le géocodage."""
+    if not isinstance(addr, str):
+        return ""
+    # suppression des doublons consécutifs
     tokens = addr.split()
     cleaned = []
     prev = None
     for t in tokens:
-        if t.lower() != prev:
+        if t != prev:
             cleaned.append(t)
-        prev = t.lower()
-    return " ".join(cleaned)
-
-
-def expand_abbreviations(addr: str) -> str:
-    """Remplace les abréviations courantes par leur forme complète."""
-    mapping = {
-        "\bbd\b": "Boulevard",
-        "\bav\b": "Avenue",
-        "\bres\b": "Résidence",
-        "\bche\b": "Chemin",
-        "\brte\b": "Route"
+        prev = t
+    s = " ".join(cleaned)
+    # abréviations courantes
+    repl = {
+        r"\bbd\b": "boulevard",
+        r"\bav\b": "avenue",
+        r"\bres\b": "résidence",
+        r"\brte\b": "rue",
+        r"\bchemin\b": "chemin"
     }
-    import re
-    for abbr, full in mapping.items():
-        addr = re.sub(abbr, full, addr, flags=re.IGNORECASE)
-    return addr
+    for k, v in repl.items():
+        s = pd.Series([s]).str.replace(k, v, regex=True, case=False)[0]
+    return s
 
-
-def replace_synonyms(addr: str) -> str:
-    """Tente des synonymes pour corriger des erreurs de type 'route' vs 'rue'."""
-    synonyms = {
-        " Route ": " Rue ",
-        " Rte ": " Rue ",
-        " Chemin ": " Rue "
-    }
-    for wrong, right in synonyms.items():
-        addr = addr.replace(wrong, right)
-    return addr
-
-
-def geocode_address(addr: str):
-    """Essaye de géocoder l'adresse, avec nettoyages et corrections successives."""
-    variations = [addr,
-                  clean_address(addr),
-                  expand_abbreviations(clean_address(addr)),
-                  replace_synonyms(expand_abbreviations(clean_address(addr)))]
-    for var in variations:
-        try:
-            url = "https://nominatim.openstreetmap.org/search"
-            params = {"q": var, "format": "json", "limit": 1}
-            headers = {"User-Agent": USER_AGENT}
-            resp = requests.get(url, params=params, headers=headers)
-            if resp.status_code == 200 and resp.json():
-                data = resp.json()[0]
-                return float(data["lat"]), float(data["lon"]), var
-        except Exception:
-            pass
-        time.sleep(1)
-    return None, None, None
-
+@st.cache_data
+def geocode(addr: str):
+    """Retourne (lat, lon) via Nominatim ou (None, None) si échec."""
+    url = "https://nominatim.openstreetmap.org/search"
+    params = {"q": addr, "format": "json", "limit": 1}
+    headers = {"User-Agent": USER_AGENT}
+    try:
+        r = requests.get(url, params=params, headers=headers, timeout=10)
+        if r.ok and r.json():
+            d = r.json()[0]
+            return float(d["lat"]), float(d["lon"])
+    except Exception:
+        pass
+    return None, None
 
 @st.cache_data
 def load_tournees():
     df = pd.read_excel("Base_tournees_KML_coordonnees.xlsx")
-    # calculer centroids et rayons
-    centroids = []
-    radii = []
-    for name, group in df.groupby("Tournée"):
-        lats = group["Latitude"]
-        lons = group["Longitude"]
-        centroid_lat = lats.mean()
-        centroid_lon = lons.mean()
+    # calcul de centroides et rayons pour chaque tournée
+    out = []
+    for name, grp in df.groupby('Tournée'):
+        lat_mean = grp['Latitude'].mean()
+        lon_mean = grp['Longitude'].mean()
         # rayon max
-        max_dist = max(distance_haversine(centroid_lat, centroid_lon, lat, lon)
-                       for lat, lon in zip(lats, lons))
-        centroids.append((name, centroid_lat, centroid_lon, max_dist))
-    return centroids
+        grp['dist'] = grp.apply(lambda r: distance_haversine(lat_mean, lon_mean, r['Latitude'], r['Longitude']), axis=1)
+        radius = grp['dist'].max()
+        out.append({
+            'Tournée': name,
+            'cent_lat': lat_mean,
+            'cent_lon': lon_mean,
+            'rayon_km': radius
+        })
+    return pd.DataFrame(out)
 
+# --- Interface ---
+st.set_page_config(page_title="Attribution Automatique des Tournées PACA", layout='wide')
+st.title("🗺️ Attribution Automatique des Tournées PACA")
+st.write("Upload un fichier clients (Adresse, CP, Ville, etc.). L'app nettoie, géocode, et attribue la tournée ou marque HZ.")
 
-def main():
-    st.title("Attribution Automatique des Tournées PACA")
-    st.write("Upload fichier clients (Adresse, CP, Ville...). L'app attribue ou marque HZ hors zone.")
-    uploaded = st.file_uploader("Fichier Excel/CSV", type=["xlsx", "xls", "csv"])
-    if not uploaded:
-        return
-    # lecture
-    if uploaded.name.endswith((".xlsx", ".xls")):
-        df = pd.read_excel(uploaded, header=0)
-    else:
-        df = pd.read_csv(uploaded, header=0)
+uploaded = st.file_uploader("Fichier Excel/CSV à traiter", type=["xlsx","xls","csv"])
+if not uploaded:
+    st.stop()
 
-    st.write("Colonnes détectées :", list(df.columns))
-    # sélection des colonnes
-    cols = [c for c in df.columns if isinstance(c, str)]
-    addr_cols = st.multiselect("Colonnes Adresse (voie, rue...) :", cols, default=[c for c in cols if any(k in c.lower() for k in ["voie","rue","chemin","av","bd"])][:2])
-    cp_col = st.selectbox("Colonne Code Postal :", cols, index=cols.index(next((c for c in cols if "code" in c.lower()), cols[0])))
-    ville_col = st.selectbox("Colonne Ville :", cols, index=cols.index(next((c for c in cols if "ville" in c.lower()), cols[0])))
+# Lecture avec détection de l'en-tête
+raw = pd.read_excel(uploaded, header=None)
+header_idx = 0
+for idx, row in raw.iterrows():
+    if row.astype(str).str.contains('adresse', case=False, na=False).any():
+        header_idx = idx
+        break
+# relire avec le bon header
+if str(uploaded.name).lower().endswith(('xls','xlsx')):
+    df = pd.read_excel(uploaded, header=header_idx)
+else:
+    df = pd.read_csv(uploaded, header=header_idx)
 
-    # concat adresse
-    df['_full_address'] = df[addr_cols].astype(str).apply(lambda row: ' '.join(row.values), axis=1) + \
-                         ' ' + df[cp_col].astype(str) + ' ' + df[ville_col].astype(str)
+st.write("**Colonnes détectées (après header)** : ", list(df.columns))
 
-    centroids = load_tournees()
-    # geocode et attribution
-    tournee_assigne = []
-    dist_list = []
-    for addr in df['_full_address']:
-        lat, lon, used = geocode_address(addr)
-        if lat is None:
-            tournee_assigne.append("HZ")
-            dist_list.append(None)
-            continue
-        # calcul distances aux centroids
-        best = (None, float('inf'))
-        for name, clat, clon, radius in centroids:
-            d = distance_haversine(lat, lon, clat, clon)
-            if d <= radius and d < best[1]:
-                best = (name, d)
-        if best[0]:
-            tournee_assigne.append(best[0])
-            dist_list.append(round(best[1],2))
-        else:
-            tournee_assigne.append("HZ")
-            dist_list.append(None)
+# Mapping dynamique des colonnes
+cols = [c for c in df.columns if isinstance(c, str)]
+addr_cols = [c for c in cols if 'adresse' in c.lower() or 'voie' in c.lower() or 'rue' in c.lower() or 'chemin' in c.lower()]
+cp_cols   = [c for c in cols if 'code' in c.lower() and 'postal' in c.lower() or c.lower()=='cp']
+ville_cols = [c for c in cols if 'ville' in c.lower() or 'commune' in c.lower()]
 
-    df['Tournée attribuée'] = tournee_assigne
-    df['Distance km'] = dist_list
+# Sélection utilisateur si multiples
+addr_sel = st.multiselect("Colonnes Adresse (voie, rue, chemin)", addr_cols, default=addr_cols)
+cp_sel   = st.selectbox("Colonne Code Postal", cp_cols)
+ville_sel = st.selectbox("Colonne Ville", ville_cols)
 
-    # export Excel
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        df.to_excel(writer, index=False)
-    data = output.getvalue()
-    st.download_button("Télécharger Excel avec Tournées", data, file_name="clients_tournees_attribues.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+# Assemblage
+df['_full_address'] = (
+    df[addr_sel].fillna('').agg(' '.join, axis=1) + ' ' +
+    df[cp_sel].astype(str).fillna('') + ' ' +
+    df[ville_sel].fillna('')
+)
+# Nettoyage
+df['_full_address'] = df['_full_address'].apply(clean_address)
 
-if __name__ == "__main__":
-    main()
+# Géocodage
+lats, lons = [], []
+for addr in df['_full_address']:
+    lat, lon = geocode(addr)
+    if lat is None:
+        # retry with raw addr
+        lat, lon = geocode(addr)
+    lats.append(lat); lons.append(lon)
+    time.sleep(1)
+df['Latitude'] = lats; df['Longitude'] = lons
+
+# Chargement tournées
+df_tour = load_tournees()
+
+# Attribution
+assigned, dists = [], []
+for _, row in df.iterrows():
+    best = ('HZ', None)
+    if pd.notna(row['Latitude']):
+        for _, t in df_tour.iterrows():
+            d = distance_haversine(row['Latitude'], row['Longitude'], t['cent_lat'], t['cent_lon'])
+            if d <= t['rayon_km']:
+                best = (t['Tournée'], d)
+                break
+    assigned.append(best[0]); dists.append(best[1])
+
+df['Tournée attribuée'] = assigned
+df['Distance (km)'] = dists
+
+# Affichage et téléchargement
+st.dataframe(df)
+
+# Excel download
+buffer = io.BytesIO()
+with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
+    df.to_excel(writer, index=False, sheet_name='Résultat')
+    writer.save()
+buffer.seek(0)
+
+st.download_button("Télécharger résultat (.xlsx)", data=buffer, 
+                   file_name="clients_tournees_attribués.xlsx", 
+                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
