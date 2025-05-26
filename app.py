@@ -9,19 +9,10 @@ from shapely.geometry import MultiPoint, Point
 # --- Configuration ---
 USER_AGENT = "TourneeLocator/1.0 (contact@votredomaine.com)"
 TOURNEES_FILE = "Base_tournees_KML_coordonnees.xlsx"
-
-# --- Fonctions utilitaires ---
-def distance_haversine(lat1, lon1, lat2, lon2):
-    """Distance en km entre deux points GPS."""
-    R = 6371
-    dlat = radians(lat2 - lat1)
-    dlon = radians(lon2 - lon1)
-    a = sin(dlat/2)**2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon/2)**2
-    c = 2 * atan2(sqrt(a), sqrt(1 - a))
-    return R * c
+# Tampon (en degrés) ~ 50 m à l'équateur
+BUFFER_DEGREES = 0.0005  
 
 def clean_address(addr: str) -> str:
-    """Nettoie l'adresse en supprimant doublons et abréviations."""
     tokens = addr.split()
     cleaned, prev = [], None
     for t in tokens:
@@ -36,7 +27,6 @@ def clean_address(addr: str) -> str:
 
 @st.cache_data(show_spinner=False)
 def geocode(address: str):
-    """Géocode via Nominatim: adresse brute puis nettoyée."""
     headers = {"User-Agent": USER_AGENT}
     for variant in (address, clean_address(address)):
         try:
@@ -56,23 +46,28 @@ def geocode(address: str):
 
 @st.cache_data
 def load_tournees():
-    """Charge les tournées et construit leurs convex hulls."""
+    """
+    Charge les tournées depuis Excel et construit pour chacune 
+    un polygone convex hull légèrement tamponné pour inclure ses frontières.
+    """
     df = pd.read_excel(TOURNEES_FILE)
     tourns = {}
     for name, grp in df.groupby("Tournée"):
         pts = [Point(lon, lat) for lat, lon in zip(grp["Latitude"], grp["Longitude"])]
-        tourns[name] = MultiPoint(pts).convex_hull
+        hull = MultiPoint(pts).convex_hull
+        # on ajoute un petit tampon pour capturer les points sur le bord
+        tourns[name] = hull.buffer(BUFFER_DEGREES)
     return tourns
 
 def main():
     st.title("Attribution Automatique des Tournées PACA")
-    st.write("Upload ton fichier clients (Adresse, CP, Ville…), puis récupère un .xlsx enrichi.")
+    st.write("Upload ton fichier clients (Adresse, CP, Ville…), l'app géocode et associe chaque client.")
 
     uploaded = st.file_uploader("Fichier Excel/CSV", type=["xlsx","xls","csv"])
     if not uploaded:
         return
 
-    # Détection de l'en-tête
+    # 1) Détection de la ligne d'en-tête
     raw = pd.read_excel(uploaded, header=None)
     header_idx = 0
     for i, row in raw.iterrows():
@@ -80,53 +75,57 @@ def main():
         if any(k in txt for k in ("adresse", "cp", "codepostal", "ville")):
             header_idx = i
             break
-    df_clients = pd.read_excel(uploaded, header=header_idx)
-    st.write("Colonnes détectées :", list(df_clients.columns))
+    df = pd.read_excel(uploaded, header=header_idx)
+    st.write("Colonnes détectées :", list(df.columns))
 
-    # Construction d'une adresse complète
-    addr_cols = [c for c in df_clients.columns if any(w in c.lower() for w in ("adresse","voie","rue","route","chemin"))]
-    cp_col = next((c for c in df_clients.columns if "codepostal" in c.lower() or c.lower()=="cp"), None)
-    ville_col = next((c for c in df_clients.columns if "ville" in c.lower()), None)
-    df_clients["_full_address"] = ""
+    # 2) Construction du champ d'adresse complète
+    addr_cols = [c for c in df.columns if any(w in c.lower() for w in ("adresse","voie","rue","route","chemin"))]
+    cp_col = next((c for c in df.columns if "codepostal" in c.lower() or c.lower()=="cp"), None)
+    ville_col = next((c for c in df.columns if "ville" in c.lower()), None)
+    df["_full_address"] = ""
     for c in addr_cols + ([cp_col] if cp_col else []) + ([ville_col] if ville_col else []):
-        df_clients["_full_address"] += df_clients[c].fillna("").astype(str) + " "
-    
-    # Géocodage avec barre de progression
+        df["_full_address"] += df[c].fillna("").astype(str) + " "
+
+    # 3) Géocodage avec barre de progression
     lats, lons = [], []
-    total = len(df_clients)
+    total = len(df)
     progress_bar = st.progress(0)
     st.write(f"🔍 Géocodage de {total} adresses…")
-    for i, addr in enumerate(df_clients["_full_address"]):
+    for i, addr in enumerate(df["_full_address"]):
         lat, lon = geocode(addr)
         lats.append(lat); lons.append(lon)
         progress_bar.progress((i + 1) / total)
-    df_clients["Latitude"] = lats
-    df_clients["Longitude"] = lons
+    df["Latitude"] = lats
+    df["Longitude"] = lons
     st.success("✅ Géocodage terminé")
 
-    # Attribution via convex hull
+    # 4) Attribution avec convex hull tamponné
     tourns = load_tournees()
     attribs = []
-    for _, row in df_clients.iterrows():
-        latc, lonc = row["Latitude"], row["Longitude"]
+    for _, row in df.iterrows():
         choix = "HZ"
+        latc, lonc = row["Latitude"], row["Longitude"]
         if pd.notna(latc) and pd.notna(lonc):
             pt = Point(lonc, latc)
-            for name, hull in tourns.items():
-                if hull.contains(pt):
+            for name, poly in tourns.items():
+                # on utilise intersects pour capturer bord et intérieur
+                if poly.intersects(pt):
                     choix = name
                     break
         attribs.append(choix)
-    df_clients["Tournée attribuée"] = attribs
+    df["Tournée attribuée"] = attribs
     st.success("✅ Attribution terminée")
 
-    # Export Excel
+    # 5) Export Excel
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        df_clients.to_excel(writer, index=False)
-    st.download_button("Télécharger le fichier enrichi (.xlsx)", buffer.getvalue(),
-                       file_name="clients_tournees_enrichi.xlsx",
-                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        df.to_excel(writer, index=False)
+    st.download_button(
+        "Télécharger le fichier enrichi (.xlsx)",
+        buffer.getvalue(),
+        file_name="clients_tournees_enrichi.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
 
 if __name__ == "__main__":
     main()
