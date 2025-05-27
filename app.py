@@ -20,12 +20,26 @@ def distance_haversine(lat1, lon1, lat2, lon2):
     c = 2 * atan2(sqrt(a), sqrt(1 - a))
     return R * c
 
+def clean_address(addr: str) -> str:
+    """Nettoie l'adresse en supprimant doublons, abréviations et accents."""
+    s = unidecode(addr)
+    tokens = s.split()
+    cleaned, prev = [], None
+    for t in tokens:
+        tl = t.lower().strip(".,")
+        if tl in ("bd","bld","boul"): t="boulevard"
+        elif tl in ("av","av.","aven"): t="avenue"
+        elif tl in ("res","res."): t="residence"
+        if t.lower() != prev:
+            cleaned.append(t)
+            prev = t.lower()
+    return " ".join(cleaned)
+
 @st.cache_data(show_spinner=False)
 def geocode(address: str):
-    """Géocode une adresse via Nominatim (brute puis nettoyée)."""
+    """Géocode via Nominatim: adresse brute puis nettoyée."""
     headers = {"User-Agent": USER_AGENT}
-    cleaned = unidecode(address)
-    for variant in (cleaned, cleaned):  # tenter deux fois identique pour garantir
+    for variant in (address, clean_address(address)):
         try:
             resp = requests.get(
                 "https://nominatim.openstreetmap.org/search",
@@ -41,89 +55,90 @@ def geocode(address: str):
         time.sleep(1)
     return None, None
 
-@st.cache_data
-def load_base_tournees():
-    """Charge la base des tournées avec leurs points GPS."""
-    df = pd.read_excel(TOURNEES_FILE)
-    groups = {}
-    for name, grp in df.groupby("Tournée"):
-        coords = list(zip(grp["Latitude"], grp["Longitude"]))
-        groups[name] = coords
-    return groups
-
-# --- Application ---
+# --- Application principale ---
 def main():
-    st.title("Attribution Tournées PACA (Proche + Nearest)")
-    st.write("Upload un fichier client (Adresse, CP, Ville…). L’app attribue la tournée la plus proche si à l’intérieur du seuil, sinon HZ.")
+    st.title("Attribution Automatique des Tournées PACA")
+    st.write("1) Uploade ton fichier clients (Adresse, CP, Ville…)\n2) Ajuste la distance max\n3) Télécharge ton fichier enrichi")
 
     uploaded = st.file_uploader("Fichier Excel/CSV", type=["xlsx","xls","csv"])
     if not uploaded:
         return
 
-    # Lecture avec détection d'en-tête
+    # 1) Détection de l'en-tête
     raw = pd.read_excel(uploaded, header=None)
     header_idx = 0
     for i, row in raw.iterrows():
         txt = " ".join(map(str, row.tolist())).lower()
-        if any(k in txt for k in ("adresse", "cp", "codepostal", "ville")):
+        if any(k in txt for k in ("adresse","cp","codepostal","ville")):
             header_idx = i
             break
     df = pd.read_excel(uploaded, header=header_idx)
     st.write("Colonnes détectées :", list(df.columns))
 
-    # Concaténation et normalisation de l'adresse
+    # 2) Construction du champ d'adresse complète
     addr_cols = [c for c in df.columns if any(w in c.lower() for w in ("adresse","voie","rue","route","chemin"))]
     cp_col = next((c for c in df.columns if "codepostal" in c.lower() or c.lower()=="cp"), None)
     ville_col = next((c for c in df.columns if "ville" in c.lower()), None)
     df["_full_address"] = ""
     for c in addr_cols + ([cp_col] if cp_col else []) + ([ville_col] if ville_col else []):
         df["_full_address"] += df[c].fillna("").astype(str) + " "
-    df["_full_address"] = df["_full_address"].apply(lambda x: unidecode(x).strip())
 
-    # Géocodage
-    total = len(df)
-    st.write(f"🔍 Géocodage de {total} adresses…")
-    progress_bar = st.progress(0)
+    # 3) Géocodage avec progression
     lats, lons = [], []
+    total = len(df)
+    progress_bar = st.progress(0)
+    st.write(f"🔍 Géocodage de {total} adresses…")
     for i, addr in enumerate(df["_full_address"]):
         lat, lon = geocode(addr)
         lats.append(lat); lons.append(lon)
         progress_bar.progress((i+1)/total)
-    df["Latitude"] = lats; df["Longitude"] = lons
+    df["Latitude"] = lats
+    df["Longitude"] = lons
     st.success("✅ Géocodage terminé")
 
-    # Chargement base tournées
-    base = load_base_tournees()
+    # 4) Lecture de la base historique des tournées
+    df_ref = pd.read_excel(TOURNEES_FILE)
 
-    # Seuil de proximité (km)
-    seuil = st.number_input("Seuil de proximité (km) pour attribution, sinon HZ", min_value=0.1, value=0.5, step=0.1)
+    # 5) Slider de distance max (km)
+    max_dist = st.slider(
+        "Distance max pour attribuer une tournée (km)",
+        0.1, 10.0, 1.0, step=0.1
+    )
 
-    # Attribution par distance au plus proche point de chaque tournée
-    st.write("🔄 Attribution des tournées…")
+    # 6) Attribution par plus proche voisin
+    st.write("🚚 Attribution des tournées…")
     attribs = []
-    for _, row in df.iterrows():
+    for idx, row in df.iterrows():
         latc, lonc = row["Latitude"], row["Longitude"]
         if pd.isna(latc) or pd.isna(lonc):
             attribs.append("HZ")
             continue
-        # calcule min distance par tournée
-        best = (None, float('inf'))
-        for name, coords in base.items():
-            for lat2, lon2 in coords:
-                d = distance_haversine(latc, lonc, lat2, lon2)
-                if d < best[1]: best = (name, d)
-        # assignation selon seuil
-        choix = best[0] if best[1] <= seuil else "HZ"
-        attribs.append(choix)
+
+        # Calcul des distances à tous les points historiques
+        dists = df_ref.apply(
+            lambda r: distance_haversine(latc, lonc, r["Latitude"], r["Longitude"]),
+            axis=1
+        )
+        i_min = dists.idxmin()
+        d_min = dists.iat[i_min]
+
+        if d_min <= max_dist:
+            attribs.append(df_ref.at[i_min, "Tournée"])
+        else:
+            attribs.append("HZ")
+
+        progress_bar.progress((idx+1)/total)
+
     df["Tournée attribuée"] = attribs
     st.success("✅ Attribution terminée")
 
-    # Export Excel
-    buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+    # 7) Export Excel
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
         df.to_excel(writer, index=False)
     st.download_button(
-        "Télécharger (.xlsx)", buf.getvalue(),
+        "Télécharger le fichier enrichi (.xlsx)",
+        buffer.getvalue(),
         file_name="clients_tournees_enrichi.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
