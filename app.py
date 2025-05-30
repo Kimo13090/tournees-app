@@ -9,24 +9,39 @@ from unidecode import unidecode
 # --- Configuration ---
 USER_AGENT = "TourneeLocator/1.0 (contact@votredomaine.com)"
 TOURNEES_FILE = "Base_tournees_KML_coordonnees.xlsx"
+MAX_DIST_KM = 1.0  # seuil fixe en km pour attribuer une tournée
 
 # --- Fonctions utilitaires ---
 def distance_haversine(lat1, lon1, lat2, lon2):
-    """Calcule la distance en km entre deux points GPS."""
+    """Distance en km entre deux points GPS."""
     R = 6371
     dlat = radians(lat2 - lat1)
     dlon = radians(lon2 - lon1)
-    a = sin(dlat/2)**2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon/2)**2
+    a = sin(dlat/2)**2 + cos(radians(lat1))*cos(radians(lat2))*sin(dlon/2)**2
     c = 2 * atan2(sqrt(a), sqrt(1 - a))
     return R * c
 
+def clean_address(addr: str) -> str:
+    """Nettoie l'adresse : doublons, abréviations, accents."""
+    s = unidecode(addr)
+    tokens, prev, cleaned = s.split(), None, []
+    for t in tokens:
+        tl = t.lower().strip(".,")
+        if tl in ("bd","bld","boul"): t = "boulevard"
+        elif tl in ("av","av.","aven"): t = "avenue"
+        elif tl in ("res","res."): t = "residence"
+        if t.lower() != prev:
+            cleaned.append(t)
+            prev = t.lower()
+    return " ".join(cleaned)
+
 @st.cache_data(show_spinner=False)
 def geocode(address: str):
-    """Géocode via Nominatim: essaie adresse brute puis nettoyée."""
+    """Géocode via Nominatim : adresse brute puis nettoyée."""
     headers = {"User-Agent": USER_AGENT}
-    for variant in (address, unidecode(address)):
+    for variant in (address, clean_address(address)):
         try:
-            resp = requests.get(
+            r = requests.get(
                 "https://nominatim.openstreetmap.org/search",
                 params={"q": variant, "format": "json", "limit": 1},
                 headers=headers,
@@ -34,22 +49,15 @@ def geocode(address: str):
             )
         except:
             continue
-        if resp.status_code == 200 and resp.json():
-            d = resp.json()[0]
+        if r.status_code == 200 and r.json():
+            d = r.json()[0]
             return float(d["lat"]), float(d["lon"])
         time.sleep(1)
     return None, None
 
-@st.cache_data
-def load_tournees_ref():
-    """Charge la base de tournées (points historiques)."""
-    df = pd.read_excel(TOURNEES_FILE)
-    return df  # colonnes: Tournée, Latitude, Longitude
-
-# --- Application Streamlit ---
 def main():
     st.title("Attribution Automatique des Tournées PACA")
-    st.write("Upload ton fichier clients (Adresse, CP, Ville…). L'app attribue une tournée ou marque HZ.")
+    st.write("1. Uploade ton fichier clients (Adresse, CP, Ville…)\n2. Clique sur 'Télécharger'")
 
     uploaded = st.file_uploader("Fichier Excel/CSV", type=["xlsx","xls","csv"])
     if not uploaded:
@@ -60,77 +68,73 @@ def main():
     header_idx = 0
     for i, row in raw.iterrows():
         txt = " ".join(map(str, row.tolist())).lower()
-        if any(k in txt for k in ("adresse", "cp", "codepostal", "ville")):
+        if any(k in txt for k in ("adresse","cp","codepostal","ville")):
             header_idx = i
             break
-    df_clients = pd.read_excel(uploaded, header=header_idx)
-    st.write("Colonnes détectées :", list(df_clients.columns))
+    df = pd.read_excel(uploaded, header=header_idx)
+    st.write("Colonnes détectées :", list(df.columns))
 
-    # 2) Construction du champ adresse complète
-    addr_cols = [c for c in df_clients.columns if any(w in c.lower() for w in ("adresse","voie","rue","route","chemin"))]
-    cp_col = next((c for c in df_clients.columns if "codepostal" in c.lower() or c.lower()=="cp"), None)
-    ville_col = next((c for c in df_clients.columns if "ville" in c.lower()), None)
-    df_clients["_full_address"] = ""
+    # 2) Construction du champ d'adresse complète
+    addr_cols = [
+        c for c in df.columns 
+        if any(w in c.lower() for w in ("adresse","voie","rue","route","chemin"))
+    ]
+    cp_col = next((c for c in df.columns if "codepostal" in c.lower() or c.lower()=="cp"), None)
+    ville_col = next((c for c in df.columns if "ville" in c.lower()), None)
+
+    df["_full_address"] = ""
     for c in addr_cols + ([cp_col] if cp_col else []) + ([ville_col] if ville_col else []):
-        df_clients["_full_address"] += df_clients[c].fillna("").astype(str) + " "
-    df_clients["_full_address"] = df_clients["_full_address"].apply(lambda x: unidecode(x))
+        df["_full_address"] += df[c].fillna("").astype(str) + " "
 
-    # 3) Géocodage
-    lats, lons = [], []
-    total = len(df_clients)
+    # 3) Géocodage avec progression
+    total = len(df)
+    st.write(f"🔍 Géocodage de {total} adresses…")
     progress = st.progress(0)
-    st.write(f"🔍 Géocodage de {total} adresses...")
-    for i, addr in enumerate(df_clients["_full_address"]):
+    lats, lons = [], []
+    for i, addr in enumerate(df["_full_address"]):
         lat, lon = geocode(addr)
-        lats.append(lat); lons.append(lon)
-        progress.progress((i+1)/total)
-    df_clients["Latitude"] = lats
-    df_clients["Longitude"] = lons
+        lats.append(lat)
+        lons.append(lon)
+        progress.progress((i + 1) / total)
+    df["Latitude"] = lats
+    df["Longitude"] = lons
     st.success("✅ Géocodage terminé")
 
-    # 4) Chargement de la base référence
-    df_ref = load_tournees_ref()
+    # 4) Lecture de la base historique des tournées
+    df_ref = pd.read_excel(TOURNEES_FILE)
 
-    # 5) Slider de distance max pour attribuer
-    max_dist = st.slider(
-        "Distance max pour attribuer une tournée (km)",
-        min_value=0.1, max_value=5.0, value=1.0, step=0.1
-    )
-
-    # 6) Attribution par plus proche voisin
+    # 5) Attribution par plus proche voisin sans "HZ"
+    st.write("🚚 Attribution des tournées…")
+    progress = st.progress(0)
     attribs = []
-    st.write(f"🚚 Attribution des tournées pour {total} clients...")
-    for idx, row in df_clients.iterrows():
-        latc, lonc = row["Latitude"], row["Longitude"]
+    for i, row in enumerate(df.itertuples()):
+        latc, lonc = getattr(row, "Latitude"), getattr(row, "Longitude")
         if pd.isna(latc) or pd.isna(lonc):
-            attribs.append("HZ")
+            attrib = ""  # pas géocodé → vide
         else:
-            # calcul des distances à tous les points historiques
             dists = df_ref.apply(
                 lambda r: distance_haversine(latc, lonc, r["Latitude"], r["Longitude"]),
                 axis=1
             )
             i_min = dists.idxmin()
             d_min = dists.iat[i_min]
-            if d_min <= max_dist:
-                attribs.append(df_ref.at[i_min, "Tournée"] )
-            else:
-                attribs.append("HZ")
-        progress.progress((idx+1)/total)
+            attrib = df_ref.at[i_min, "Tournée"] if d_min <= MAX_DIST_KM else ""
+        attribs.append(attrib)
+        progress.progress((i + 1) / total)
 
-    df_clients["Tournée attribuée"] = attribs
+    df["Tournée attribuée"] = attribs
     st.success("✅ Attribution terminée")
 
-    # 7) Export Excel
+    # 6) Export .xlsx
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        df_clients.to_excel(writer, index=False)
+        df.to_excel(writer, index=False)
     st.download_button(
         "Télécharger le fichier enrichi (.xlsx)",
         buffer.getvalue(),
-        file_name="clients_tournees_enrichi.xlsx",
+        file_name="clients_tournees.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
