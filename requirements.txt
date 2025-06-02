@@ -1,6 +1,6 @@
 streamlit
 pandas
+numpy
 requests
 openpyxl
 unidecode
-numpy
