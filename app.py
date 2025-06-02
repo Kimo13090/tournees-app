@@ -3,32 +3,51 @@ import pandas as pd
 import requests
 import time
 import io
+import numpy as np
 from math import radians, sin, cos, sqrt, atan2
 from unidecode import unidecode
-import numpy as np
 
 # --- Configuration ---
 USER_AGENT = "TourneeLocator/1.0 (contact@votredomaine.com)"
 TOURNEES_FILE = "Base_tournees_KML_coordonnees.xlsx"
 
 # --- Fonctions utilitaires ---
+
 def distance_haversine(lat1, lon1, lat2, lon2):
     """
-    Calcule la distance en kilomètres entre deux points GPS.
+    Calcule la distance (en km) entre deux points GPS scalaires (lat1, lon1) et (lat2, lon2).
     """
     R = 6371.0  # Rayon de la Terre en km
     dlat = radians(lat2 - lat1)
     dlon = radians(lon2 - lon1)
-    a = sin(dlat / 2) ** 2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon / 2) ** 2
+    a = sin(dlat / 2)**2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon / 2)**2
     c = 2 * atan2(sqrt(a), sqrt(1 - a))
     return R * c
 
+def distance_haversine_array(lat0, lon0, lat_array, lon_array):
+    """
+    Version vectorisée de distance_haversine : calcule la distance (en km) entre
+    un point (lat0, lon0) et un tableau de points (lat_array, lon_array) de même taille.
+    """
+    R = 6371.0
+    # Convertir en radians
+    lat0_rad = np.radians(lat0)
+    lon0_rad = np.radians(lon0)
+    lat_rad = np.radians(lat_array)
+    lon_rad = np.radians(lon_array)
+
+    dlat = lat_rad - lat0_rad
+    dlon = lon_rad - lon0_rad
+    a = np.sin(dlat / 2)**2 + np.cos(lat0_rad) * np.cos(lat_rad) * np.sin(dlon / 2)**2
+    c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
+    return R * c  # renvoie un tableau de distances
+
 def clean_address(addr: str) -> str:
     """
-    Nettoie l'adresse en :
-      - supprimant accents/diacritiques (unidecode)
-      - remplaçant abréviations courantes
-      - supprimant doublons consécutifs
+    Nettoie l'adresse :
+      - Supprime les diacritiques (unidecode)
+      - Développe quelques abréviations courantes (bd → boulevard, av → avenue, res → residence)
+      - Supprime les doublons consécutifs de mots
     """
     s = unidecode(addr or "")
     tokens = s.split()
@@ -52,7 +71,7 @@ def geocode(address: str):
     """
     Géocode une adresse via Nominatim :
       1) essai sur l'adresse brute
-      2) essai sur l'adresse nettoyée (clean_address)
+      2) essai sur l'adresse nettoyée
     Retourne (lat, lon) ou (None, None) si échec.
     """
     headers = {"User-Agent": USER_AGENT}
@@ -71,64 +90,60 @@ def geocode(address: str):
         if r.status_code == 200 and r.json():
             d = r.json()[0]
             return float(d["lat"]), float(d["lon"])
-        # Attente pour respecter la règle 1 requête/sec de Nominatim
-        time.sleep(1)
+        time.sleep(1)  # Respect de la règle de 1requête/sec API Nominatim
     return None, None
 
 @st.cache_data
 def load_tournees_with_nn_thresholds():
     """
-    Charge la base des tournées (TOURNEES_FILE) contenant les colonnes :
-      - 'Latitude'  (float)
-      - 'Longitude' (float)
+    Charge la base des tournées (TOURNEES_FILE), qui contient :
+      - 'Latitude' (float)
+      - 'Longitude'(float)
       - 'Tournée'   (string)
-    Pour chaque tournée :
+    Pour chaque tournée, on :
       1) extrait tous les points historiques (lat, lon)
-      2) calcule pour chaque point la distance au plus proche voisin dans la même tournée
-      3) construit un seuil = 90ème percentile de ces distances nearest‐neighbor
+      2) calcule pour chaque point l’écart le plus petit (nearest‐neighbor) au sein de la même tournée
+      3) déduit le seuil de distance = 90ᵉ percentile de ces distances
     Retourne :
-      - df_ref           : DataFrame brute (with 'Latitude','Longitude','Tournée')
-      - route_points_dict: { nom_tournée: np.array([[lat1,lon1], [lat2,lon2], ...]) }
-      - thresholds_dict   : { nom_tournée: seuil_90_percentile_km }
+      - df_ref            : DataFrame brute avec les colonnes (Latitude, Longitude, Tournée)
+      - route_points_dict : { nom_tournée: np.array([[lat, lon], ...]) }
+      - thresholds_dict   : { nom_tournée: seuil_90_percentile_en_km }
     """
     df_ref = pd.read_excel(TOURNEES_FILE)
     route_points_dict = {}
     thresholds_dict = {}
 
     for name, grp in df_ref.groupby("Tournée"):
-        # Tableau de shape (n_points, 2)
-        pts = np.vstack([grp["Latitude"].values, grp["Longitude"].values]).T  # [[lat, lon], ...]
+        pts = np.vstack([grp["Latitude"].values, grp["Longitude"].values]).T  # shape=(n_points, 2)
         route_points_dict[name] = pts
 
-        # Si la tournée n'a qu'un seul point, on met un seuil très petit (par ex. 0.1 km)
-        if pts.shape[0] == 1:
+        # Si un seul point historique dans la tournée, seuil minimal 0.1 km
+        if pts.shape[0] <= 1:
             thresholds_dict[name] = 0.1
             continue
 
-        # Calculer la distance du plus proche voisin pour chaque point
+        # Calcul des distances nearest‐neighbor pour chaque point
         nn_distances = []
         for i in range(pts.shape[0]):
-            lat_i, lon_i = pts[i]
-            # Calcul des distances à tous les autres points de la même tournée
-            dists = distance_haversine(
-                lat_i, lon_i,
-                pts[:, 0], pts[:, 1]
-            )
-            # On met distance=inf pour le même point (index i) pour ne pas se minorer
+            lat_i, lon_i = pts[i, 0], pts[i, 1]
+            # distance du point i à tous les autres points de la même tournée
+            dists = distance_haversine_array(lat_i, lon_i, pts[:, 0], pts[:, 1])
+            # Pour ne pas prendre distance à soi-même
             dists[i] = np.inf
             nn_distances.append(dists.min())
-        # Seuil = 90ème percentile des distances nearest‐neighbor
+        # Seuil = 90ᵉ percentile des distances nearest‐neighbor
         seuil = np.percentile(nn_distances, 90)
-        # S'assurer d'avoir un seuil minimal raisonnable (ex. 0.1 km)
         thresholds_dict[name] = max(seuil, 0.1)
 
     return df_ref, route_points_dict, thresholds_dict
 
 def main():
     st.title("Attribution Automatique des Tournées PACA")
-    st.write("1) Uploade ton fichier clients (Adresse, CP, Ville…)\n"
-             "2) Laisse le système déterminer automatiquement la tournée la plus appropriée\n"
-             "3) Télécharge le résultat (.xlsx)")
+    st.write(
+        "1) Uploade ton fichier clients (Adresse, CP, Ville…)\n"
+        "2) Le système détermine automatiquement la tournée la plus appropriée\n"
+        "3) Télécharge le résultat (.xlsx)"
+    )
 
     uploaded = st.file_uploader("Fichier Excel/CSV", type=["xlsx", "xls", "csv"])
     if not uploaded:
@@ -173,41 +188,38 @@ def main():
     df["Longitude"] = lons
     st.success("✅ Géocodage terminé")
 
-    # --- 4) Chargement des tournées historiques + seuils automatiques ---
+    # --- 4) Chargement des tournées historiques + calcul des seuils dynamiques ---
     df_ref, route_points_dict, thresholds_dict = load_tournees_with_nn_thresholds()
 
-    # --- 5) Attribution par plus proche voisin avec seuil dynamiques ---
+    # --- 5) Attribution par distance minimale avec seuils dynamiques ---
     st.write("🚚 Attribution des tournées…")
     progress_attr = st.progress(0)
     attribs = []
+
     for i, row in enumerate(df.itertuples()):
         latc, lonc = getattr(row, "Latitude"), getattr(row, "Longitude")
         if pd.isna(latc) or pd.isna(lonc):
-            attribs.append("")  # client non géocodé → on laisse vide
+            attribs.append("")  # adresse non géocodée → on laisse vide
         else:
-            # Calcul de la distance min du client à chaque point historique de chaque tournée
             best_route = ""
-            best_distance = float("inf")
+            best_dist = float("inf")
 
+            # Pour chaque tournée historique, calculer la distance min du client
             for route_name, pts in route_points_dict.items():
-                # pts.shape = (n_points_historic, 2)
-                # Calculer distances h-to-all route-points d’un coup
-                dists = distance_haversine(
-                    latc, lonc,
-                    pts[:, 0], pts[:, 1]
-                )
-                min_dist_to_route_points = dists.min()
-                # Conserver la plus petite parmi toutes les tournées
-                if min_dist_to_route_points < best_distance:
-                    best_distance = min_dist_to_route_points
+                # pts[:,0] = array des latitudes, pts[:,1] = array des longitudes
+                dists_to_points = distance_haversine_array(latc, lonc, pts[:, 0], pts[:, 1])
+                min_dist_to_route = dists_to_points.min()
+
+                if min_dist_to_route < best_dist:
+                    best_dist = min_dist_to_route
                     best_route = route_name
 
-            # On compare best_distance au seuil de best_route
+            # On compare best_dist avec le seuil de la tournée retenue
             seuil_route = thresholds_dict.get(best_route, 0.1)
-            if best_distance <= seuil_route:
+            if best_dist <= seuil_route:
                 attribs.append(best_route)
             else:
-                attribs.append("")  # trop loin → vide
+                attribs.append("")  # trop éloigné → on laisse vide
 
         progress_attr.progress((i + 1) / total)
 
