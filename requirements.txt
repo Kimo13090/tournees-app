@@ -4,3 +4,4 @@ numpy
 requests
 openpyxl
 unidecode
+shapely
