@@ -2,5 +2,4 @@ streamlit
 pandas
 requests
 openpyxl
-shapely
 unidecode
