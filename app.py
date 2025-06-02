@@ -7,25 +7,29 @@ import numpy as np
 from math import radians, sin, cos, sqrt, atan2
 from unidecode import unidecode
 from shapely.geometry import MultiPoint, Point
+import zipfile
+import xml.etree.ElementTree as ET
 
 # ------------------------------------------------------------------------------
 #                            CONFIGURATION GLOBALE
 # ------------------------------------------------------------------------------
 USER_AGENT = "TourneeLocator/1.0 (contact@votredomaine.com)"
-TOURNEES_FILE = "Base_tournees_KML_coordonnees.xlsx"
 
-# Facteur multiplicateur sur le seuil nearest‐neighbor 90 %
+# Fichier KMZ contenant toutes les tournées (abonnés/points historiques)
+KMZ_TOURNEES_FILE = "abonnes_portes_analyste_tournee.kmz"
+
+# Facteur multiplicateur sur le seuil nearest‐neighbor (pour tolérer léger décalage)
 NN_THRESHOLD_FACTOR = 1.5
 
 # Tampon minimal pour le convex hull (en degrés, ≃ 50 m à l’équateur)
-HULL_BUFFER_DEGREES = 0.0005  
+HULL_BUFFER_DEGREES = 0.0005
 
 # ------------------------------------------------------------------------------
 #                          FONCTIONS UTILITAIRES
 # ------------------------------------------------------------------------------
 def distance_haversine(lat1, lon1, lat2, lon2):
     """
-    Distance (en km) entre deux points GPS scalar (lat1, lon1) et (lat2, lon2).
+    Calcule la distance (en km) entre deux points GPS (lat1, lon1) et (lat2, lon2).
     """
     R = 6371.0  # rayon moyen de la Terre en km
     dlat = radians(lat2 - lat1)
@@ -36,12 +40,10 @@ def distance_haversine(lat1, lon1, lat2, lon2):
 
 def distance_haversine_array(lat0, lon0, lat_array, lon_array):
     """
-    Version vectorisée pour calculer la distance (en km) entre
-    un point (lat0, lon0) et un array de points (lat_array, lon_array).
-    Renvoie un numpy.ndarray de même longueur que lat_array.
+    Version vectorisée : distance (en km) entre un point (lat0, lon0)
+    et un tableau de points (lat_array, lon_array). Renvoie un np.ndarray.
     """
     R = 6371.0
-    # Conversion en radians
     lat0_rad = np.radians(lat0)
     lon0_rad = np.radians(lon0)
     lat_rad = np.radians(lat_array)
@@ -51,7 +53,7 @@ def distance_haversine_array(lat0, lon0, lat_array, lon_array):
     dlon = lon_rad - lon0_rad
     a = np.sin(dlat / 2) ** 2 + np.cos(lat0_rad) * np.cos(lat_rad) * np.sin(dlon / 2) ** 2
     c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
-    return R * c  # tableau de distances
+    return R * c
 
 def clean_address(addr: str) -> str:
     """
@@ -81,13 +83,14 @@ def clean_address(addr: str) -> str:
 def geocode(address: str):
     """
     Géocode une adresse via Nominatim :
-      1) essai sur l'adresse brute
-      2) essai sur l'adresse nettoyée (clean_address)
+      1) essai sur l'adresse brute + " France"
+      2) essai sur l'adresse nettoyée + " France"
     Gère le code 429 avec backoff exponentiel.
     Retourne (lat, lon) ou (None, None) si aucun résultat.
     """
     headers = {"User-Agent": USER_AGENT}
-    for variant in (address, clean_address(address)):
+    variants = [address, clean_address(address)]
+    for variant in variants:
         if not variant.strip():
             continue
         backoff = 1.0
@@ -122,35 +125,64 @@ def geocode(address: str):
 
     return None, None
 
+def load_points_from_kmz(kmz_path: str):
+    """
+    Lit un fichier KMZ, extrait le KML, et renvoie :
+      route_points_dict = { "NomTournée": np.array([[lat, lon], …]), … }
+    """
+    ns = {'kml': 'http://www.opengis.net/kml/2.2'}
+    with zipfile.ZipFile(kmz_path, 'r') as kmz:
+        kml_files = [fn for fn in kmz.namelist() if fn.lower().endswith('.kml')]
+        if not kml_files:
+            raise FileNotFoundError("Aucun fichier .kml trouvé dans le KMZ")
+        kml_name = kml_files[0]
+        with kmz.open(kml_name, 'r') as f:
+            tree = ET.parse(f)
+
+    root = tree.getroot()
+    route_points_dict = {}
+
+    for folder in root.findall('.//kml:Folder', ns):
+        name_elem = folder.find('kml:name', ns)
+        if name_elem is None or not name_elem.text:
+            continue
+        tourn_name = name_elem.text.strip()
+
+        coords_list = []
+        for placemark in folder.findall('.//kml:Placemark', ns):
+            coord_elem = placemark.find('.//kml:Point/kml:coordinates', ns)
+            if coord_elem is not None and coord_elem.text:
+                raw = coord_elem.text.strip()
+                parts = raw.split(',')
+                try:
+                    lon = float(parts[0])
+                    lat = float(parts[1])
+                    coords_list.append((lat, lon))
+                except ValueError:
+                    pass
+
+        if coords_list:
+            route_points_dict[tourn_name] = np.array(coords_list, dtype=float)
+
+    return route_points_dict
+
 @st.cache_data
 def load_tournees_with_nn_thresholds():
     """
-    Charge la base des tournées (TOURNEES_FILE) contenant :
-      - 'Latitude'  (float)
-      - 'Longitude' (float)
-      - 'Tournée'   (string)
-    Pour chaque tournée N dans ce fichier, on :
-      1) collecte tous ses points historiques (lat, lon) dans pts_N
-      2) calcule pour chaque point i de pts_N la distance au plus proche voisin
-      3) fixe le seuil_N = 90ᵉ percentile des distances nearest‐neighbor
-      4) construit un convex hull bufferisé (petit buffer pour inclure les bords)
-
+    Charge tous les points historiques de chaque tournée depuis le KMZ,
+    calcule pour chaque tournée :
+      - Son convex hull bufferisé
+      - Le 90ᵉ percentile nearest‐neighbor (threshold NN)
     Renvoie :
-      - df_ref            : DataFrame brute (Latitude, Longitude, Tournée)
-      - route_points_dict : { nom_tournée: array([[lat,lon], ...]) }
+      - route_points_dict : { nom_tournée: np.array([[lat,lon], …]), … }
       - thresholds_dict   : { nom_tournée: seuil_N_km }
       - hulls_dict        : { nom_tournée: shapely.Polygon.buffered }
     """
-    df_ref = pd.read_excel(TOURNEES_FILE)
-    route_points_dict = {}
+    route_points_dict = load_points_from_kmz(KMZ_TOURNEES_FILE)
     thresholds_dict = {}
     hulls_dict = {}
 
-    for name, grp in df_ref.groupby("Tournée"):
-        # Tableau de points historiques shape=(n_points,2)
-        pts = np.vstack([grp["Latitude"].values, grp["Longitude"].values]).T
-        route_points_dict[name] = pts
-
+    for name, pts in route_points_dict.items():
         if pts.shape[0] <= 1:
             thresholds_dict[name] = 0.1
         else:
@@ -163,11 +195,11 @@ def load_tournees_with_nn_thresholds():
             seuil = np.percentile(nn_distances, 90)
             thresholds_dict[name] = max(seuil, 0.1)
 
-        shapely_pts = [Point(lon, lat) for lat, lon in zip(grp["Latitude"], grp["Longitude"])]
+        shapely_pts = [Point(lon, lat) for lat, lon in pts]
         hull = MultiPoint(shapely_pts).convex_hull
         hulls_dict[name] = hull.buffer(HULL_BUFFER_DEGREES)
 
-    return df_ref, route_points_dict, thresholds_dict, hulls_dict
+    return route_points_dict, thresholds_dict, hulls_dict
 
 # ------------------------------------------------------------------------------
 #                                FONCTION PRINCIPALE
@@ -224,7 +256,7 @@ def main():
     st.success("✅ Géocodage terminé")
 
     # 4) Chargement des tournées historiques + calcul des seuils et hulls
-    df_ref, route_points_dict, thresholds_dict, hulls_dict = load_tournees_with_nn_thresholds()
+    route_points_dict, thresholds_dict, hulls_dict = load_tournees_with_nn_thresholds()
 
     # 5) Attribution prioritaire par CONVEX HULL tamponné, puis fallback NN
     st.write("🚚 Attribution des tournées…")
@@ -248,7 +280,7 @@ def main():
                 choix = route_name
                 break
 
-        # 5.2) Sinon fallback nearest-neighbor
+        # 5.2) Sinon fallback nearest‐neighbor
         if choix == "":
             best_route = ""
             best_dist = float("inf")
@@ -279,7 +311,7 @@ def main():
         "Télécharger le fichier enrichi (.xlsx)",
         buffer.getvalue(),
         file_name="clients_tournees.xlsx",
-        mime="application/vnd.openxmlformats-officedocument-spreadsheetml.sheet"
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
 
 if __name__ == "__main__":
