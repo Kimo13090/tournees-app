@@ -17,7 +17,7 @@ TOURNEES_FILE = "Base_tournees_KML_coordonnees.xlsx"
 # Facteur multiplicateur sur le seuil nearest‐neighbor 90 %
 NN_THRESHOLD_FACTOR = 1.5
 
-# Tampon minimal pour le convex hull (en degrés d'environ 50 m à l'équateur)
+# Tampon minimal pour le convex hull (en degrés, ≃ 50 m à l’équateur)
 HULL_BUFFER_DEGREES = 0.0005  
 
 # ------------------------------------------------------------------------------
@@ -80,29 +80,46 @@ def clean_address(addr: str) -> str:
 @st.cache_data(show_spinner=False)
 def geocode(address: str):
     """
-    Géocodage d'une adresse via Nominatim:
+    Géocode une adresse via Nominatim :
       1) essai sur l'adresse brute
       2) essai sur l'adresse nettoyée (clean_address)
+    Gère le code 429 avec backoff exponentiel.
     Retourne (lat, lon) ou (None, None) si aucun résultat.
     """
     headers = {"User-Agent": USER_AGENT}
     for variant in (address, clean_address(address)):
         if not variant.strip():
             continue
-        try:
-            r = requests.get(
-                "https://nominatim.openstreetmap.org/search",
-                params={"q": variant, "format": "json", "limit": 1},
-                headers=headers,
-                timeout=5
-            )
-        except:
-            continue
-        if r.status_code == 200 and r.json():
-            d = r.json()[0]
-            return float(d["lat"]), float(d["lon"])
-        # Respect de la règle de 1 requête/seconde pour Nominatim
-        time.sleep(1)
+        backoff = 1.0
+        while True:
+            try:
+                r = requests.get(
+                    "https://nominatim.openstreetmap.org/search",
+                    params={"q": variant + " France", "format": "json", "limit": 1},
+                    headers=headers,
+                    timeout=5
+                )
+            except requests.RequestException:
+                time.sleep(1)
+                break
+
+            if r.status_code == 200:
+                data = r.json()
+                if data:
+                    d = data[0]
+                    return float(d["lat"]), float(d["lon"])
+                time.sleep(1)
+                break
+
+            elif r.status_code == 429:
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 5.0)
+                continue
+
+            else:
+                time.sleep(1)
+                break
+
     return None, None
 
 @st.cache_data
@@ -115,14 +132,14 @@ def load_tournees_with_nn_thresholds():
     Pour chaque tournée N dans ce fichier, on :
       1) collecte tous ses points historiques (lat, lon) dans pts_N
       2) calcule pour chaque point i de pts_N la distance au plus proche voisin
-      3) fixe le seuil_N = 90e percentile des distances nearest‐neighbor
+      3) fixe le seuil_N = 90ᵉ percentile des distances nearest‐neighbor
       4) construit un convex hull bufferisé (petit buffer pour inclure les bords)
 
     Renvoie :
       - df_ref            : DataFrame brute (Latitude, Longitude, Tournée)
-      - route_points_dict : { nom_tournee: array([[lat,lon], ...]) }
-      - thresholds_dict   : { nom_tournee: seuil_N_km }
-      - hulls_dict        : { nom_tournee: shapely.Polygon.buffered }
+      - route_points_dict : { nom_tournée: array([[lat,lon], ...]) }
+      - thresholds_dict   : { nom_tournée: seuil_N_km }
+      - hulls_dict        : { nom_tournée: shapely.Polygon.buffered }
     """
     df_ref = pd.read_excel(TOURNEES_FILE)
     route_points_dict = {}
@@ -134,7 +151,6 @@ def load_tournees_with_nn_thresholds():
         pts = np.vstack([grp["Latitude"].values, grp["Longitude"].values]).T
         route_points_dict[name] = pts
 
-        # Si un seul point historique, on met un seuil minimal 0.1 km
         if pts.shape[0] <= 1:
             thresholds_dict[name] = 0.1
         else:
@@ -142,12 +158,11 @@ def load_tournees_with_nn_thresholds():
             for i in range(pts.shape[0]):
                 lat_i, lon_i = pts[i, 0], pts[i, 1]
                 dists = distance_haversine_array(lat_i, lon_i, pts[:, 0], pts[:, 1])
-                dists[i] = np.inf  # ignorer la distance à soi‐même
+                dists[i] = np.inf
                 nn_distances.append(dists.min())
             seuil = np.percentile(nn_distances, 90)
             thresholds_dict[name] = max(seuil, 0.1)
 
-        # Construire le convex hull des points historiques
         shapely_pts = [Point(lon, lat) for lat, lon in zip(grp["Latitude"], grp["Longitude"])]
         hull = MultiPoint(shapely_pts).convex_hull
         hulls_dict[name] = hull.buffer(HULL_BUFFER_DEGREES)
@@ -192,7 +207,6 @@ def main():
     df["_full_address"] = ""
     for c in addr_cols + ([cp_col] if cp_col else []) + ([ville_col] if ville_col else []):
         df["_full_address"] += df[c].fillna("").astype(str) + " "
-    # On virera accents et doublons :
     df["_full_address"] = df["_full_address"].apply(lambda x: unidecode(x))
 
     # 3) Géocodage avec barre de progression
@@ -220,26 +234,24 @@ def main():
     for i, row in enumerate(df.itertuples()):
         latc, lonc = getattr(row, "Latitude"), getattr(row, "Longitude")
 
-        # Si géocodage raté → on laisse vide
         if pd.isna(latc) or pd.isna(lonc):
             attribs.append("")
             progress_attr.progress((i + 1) / total)
             continue
 
         pt = Point(lonc, latc)
-        choix = ""  # par défaut vide
+        choix = ""
 
-        # 5.1) TENTATIVE hull.buffer : si le point est dans le hull tamponné => on assigne
+        # 5.1) Si le client est dans le hull.buffer, on l’affecte
         for route_name, hull_buf in hulls_dict.items():
             if hull_buf.contains(pt):
                 choix = route_name
                 break
 
-        # 5.2) SINON fallback nearest-neighbor
+        # 5.2) Sinon fallback nearest-neighbor
         if choix == "":
             best_route = ""
             best_dist = float("inf")
-            # Calculer pour chacune des tournées la distance min au client
             for route_name, pts in route_points_dict.items():
                 dists_to_pts = distance_haversine_array(latc, lonc, pts[:, 0], pts[:, 1])
                 dmin = float(dists_to_pts.min())
@@ -247,12 +259,11 @@ def main():
                     best_dist = dmin
                     best_route = route_name
 
-            # Si on est dans le facteur de seuil
             seuil = thresholds_dict.get(best_route, 0.1) * NN_THRESHOLD_FACTOR
             if best_dist <= seuil:
                 choix = best_route
             else:
-                choix = ""  # trop éloigné
+                choix = ""
 
         attribs.append(choix)
         progress_attr.progress((i + 1) / total)
@@ -268,9 +279,8 @@ def main():
         "Télécharger le fichier enrichi (.xlsx)",
         buffer.getvalue(),
         file_name="clients_tournees.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        mime="application/vnd.openxmlformats-officedocument-spreadsheetml.sheet"
     )
 
 if __name__ == "__main__":
     main()
-
