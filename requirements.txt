@@ -1,7 +1,7 @@
-streamlit
-pandas
-numpy
-requests
-openpyxl
-unidecode
-shapely
+streamlit>=1.10.0
+pandas>=1.3.0
+numpy>=1.21.0
+requests>=2.25.0
+openpyxl>=3.0.0
+shapely>=1.7.0
+scikit-learn>=1.0.0
