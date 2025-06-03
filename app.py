@@ -1,91 +1,187 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
 import requests
 import time
 import io
-import numpy as np
-from math import radians, sin, cos, sqrt, atan2
-from unidecode import unidecode
-from shapely.geometry import MultiPoint, Point
-import zipfile
 import xml.etree.ElementTree as ET
+from math import radians, sin, cos, sqrt, atan2
+from shapely.geometry import Point, MultiPoint
+from sklearn.neighbors import NearestNeighbors
 
 # ------------------------------------------------------------------------------
-#                            CONFIGURATION GLOBALE
-# ------------------------------------------------------------------------------
-USER_AGENT = "TourneeLocator/1.0 (contact@votredomaine.com)"
-
-# CHEMIN VERS VOTRE KMZ (vérifiez que le nom de fichier est EXACT ici)
-KMZ_TOURNEES_FILE = "abonnes_portes_analyste_tournee.kmz"
-
-# Facteur nearest­-neighbor pour tolérance
-NN_THRESHOLD_FACTOR = 2.0
-
-# Buffer autour du convex hull (en degrés, ≃ 100 m)
-HULL_BUFFER_DEGREES = 0.001
-
-# ------------------------------------------------------------------------------
-#                          FONCTIONS UTILITAIRES
+#                            FONCTIONS UTILITAIRES
 # ------------------------------------------------------------------------------
 
-def distance_haversine(lat1, lon1, lat2, lon2):
-    """Calcule la distance en km entre deux points GPS."""
-    R = 6371.0
-    dlat = radians(lat2 - lat1)
-    dlon = radians(lon2 - lon1)
-    a = sin(dlat/2)**2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon/2)**2
-    c = 2 * atan2(sqrt(a), sqrt(1 - a))
-    return R * c
+def strip_ns(tag: str) -> str:
+    """
+    Supprime un éventuel namespace d'une balise XML.
+    Ex. '{http://www.opengis.net/kml/2.2}Folder' → 'Folder'.
+    """
+    if "}" in tag:
+        return tag.split("}", 1)[1]
+    return tag
 
-def distance_haversine_array(lat0, lon0, lat_array, lon_array):
+@st.cache_data(show_spinner=False)
+def load_points_from_kml(kml_path: str):
     """
-    Version vectorisée du Haversine : 
-    renvoie un tableau de distances [dist(i)] entre (lat0,lon0) et chaque (lat_array[i], lon_array[i]).
+    Lit un fichier KML non compressé et renvoie un dict :
+      { 'NomTournée': np.array([[lat, lon], …]), … }.
+    Parcours récursivement chaque <Folder> pour extraire ses <Placemark><Point><coordinates>.
+    Gère les dossiers imbriqués (ex. un seul sous-folder 'Autre' contenant les placemarks).
     """
-    R = 6371.0
-    lat0_rad = np.radians(lat0)
-    lon0_rad = np.radians(lon0)
-    lat_rad = np.radians(lat_array)
-    lon_rad = np.radians(lon_array)
-    dlat = lat_rad - lat0_rad
-    dlon = lon_rad - lon0_rad
-    a = np.sin(dlat/2)**2 + np.cos(lat0_rad) * np.cos(lat_rad) * np.sin(dlon/2)**2
-    c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
-    return R * c
+    tree = ET.parse(kml_path)
+    root = tree.getroot()
+    route_points = {}
 
-def clean_address(addr: str) -> str:
+    def extrait_placemarks(placemarks_list):
+        """
+        À partir d'une liste d'élém. <Placemark>, retourne [(lat, lon), …].
+        """
+        pts = []
+        for pm in placemarks_list:
+            coord_elem = None
+            for node in pm.iter():
+                if strip_ns(node.tag) == "coordinates" and node.text:
+                    coord_elem = node
+                    break
+            if coord_elem is None:
+                continue
+            raw = coord_elem.text.strip()
+            parts = raw.split(",")
+            try:
+                lon = float(parts[0])
+                lat = float(parts[1])
+                pts.append((lat, lon))
+            except (ValueError, IndexError):
+                continue
+        return pts
+
+    def process_folder(folder_elem):
+        """
+        Traite un élément <Folder> pour en extraire une tournée :
+        1) Si <Folder> a des <Placemark> directs, on lit <name> du folder et on extrait 
+           leurs coordonnées.
+        2) Sinon, si il a exactement un sous-<Folder> avec des <Placemark>, 
+           on rattache ces placemarks au nom du folder parent.
+        3) Sinon, on descends récursivement dans chaque sous-<Folder>.
+        """
+        # 1) Placemark directs ?
+        placemarks_directs = [c for c in folder_elem if strip_ns(c.tag) == "Placemark"]
+        if placemarks_directs:
+            tourn_name = None
+            for child in folder_elem:
+                if strip_ns(child.tag) == "name" and child.text:
+                    tourn_name = child.text.strip()
+                    break
+            if tourn_name:
+                coords = extrait_placemarks(placemarks_directs)
+                if coords:
+                    route_points[tourn_name] = np.array(coords, dtype=float)
+            return
+
+        # 2) Cherche un unique sous-folder avec des placemarks
+        subfolders = [c for c in folder_elem if strip_ns(c.tag) == "Folder"]
+        if len(subfolders) == 1:
+            sous = subfolders[0]
+            placemarks_sous = [c for c in sous if strip_ns(c.tag) == "Placemark"]
+            if placemarks_sous:
+                tourn_name = None
+                for child in folder_elem:
+                    if strip_ns(child.tag) == "name" and child.text:
+                        tourn_name = child.text.strip()
+                        break
+                if tourn_name:
+                    coords = extrait_placemarks(placemarks_sous)
+                    if coords:
+                        route_points[tourn_name] = np.array(coords, dtype=float)
+                return
+            # Si ce sous-folder n'a pas de placemark direct, on descend encore
+            process_folder(sous)
+            return
+
+        # 3) Sinon, on descend dans chacun des sous-dossiers
+        for subf in subfolders:
+            process_folder(subf)
+
+    # Lancer la récursion sur tous les <Folder>
+    for elem in root.iter():
+        if strip_ns(elem.tag) == "Folder":
+            process_folder(elem)
+
+    return route_points
+
+@st.cache_data(show_spinner=False)
+def load_tournees_with_nn_thresholds(kml_file: str, default_threshold_km: float = 0.15):
     """
-    Nettoie l'adresse : 
-    - supprime les accents (unidecode) 
-    - remplace les abréviations courantes (bd→boulevard, av→avenue, res→résidence)
-    - supprime les doublons consécutifs
+    Charge les tournées depuis un KML (non compressé) :
+      - route_points_dict : { 'NomTournée': np.array([[lat,lon], ...]), ... }
+      - thresholds_dict   : { 'NomTournée': seuil_km, ... }
+      - hulls_dict        : { 'NomTournée': convex_hull (Shapely), ... }
+
+    Seuil calculé comme médiane des NN distances × 2 (minimum default_threshold_km).
+    Buffer sur le hull = petit buffer interne (non inclus ici).
     """
-    s = unidecode(addr or "")
-    tokens = s.split()
-    cleaned = []
-    prev = None
-    for t in tokens:
-        tl = t.lower().strip(".,")
-        if tl in ("bd", "bld", "boul"):
-            t = "boulevard"
-        elif tl in ("av", "av.", "aven"):
-            t = "avenue"
-        elif tl in ("res", "res."):
-            t = "residence"
-        if t.lower() != prev:
-            cleaned.append(t)
-            prev = t.lower()
-    return " ".join(cleaned)
+    route_points_dict = load_points_from_kml(kml_file)
+    if not route_points_dict:
+        return None, None, None
+
+    # Construire DataFrame plat pour NN
+    rows = []
+    for tourn, pts in route_points_dict.items():
+        for lat, lon in pts:
+            rows.append({"Tournée": tourn, "Latitude": lat, "Longitude": lon})
+    df_ref = pd.DataFrame(rows)
+
+    # nearest neighbor
+    nbrs = NearestNeighbors(n_neighbors=2, algorithm="ball_tree").fit(df_ref[["Latitude", "Longitude"]])
+    distances, _ = nbrs.kneighbors(df_ref[["Latitude", "Longitude"]])
+    df_ref["NN_dist_km"] = distances[:, 1]
+
+    thresholds = {}
+    hulls = {}
+    from shapely.geometry import MultiPoint
+    for tourn, grp in df_ref.groupby("Tournée"):
+        median_nn = grp["NN_dist_km"].median()
+        seuil = float(max(median_nn * 2, default_threshold_km))
+        thresholds[tourn] = seuil
+        # centre non utilisé ici mais pourrait servir
+        # pts for hull
+        pts = route_points_dict[tourn]
+        shp_pts = [Point(lon, lat) for lat, lon in pts]
+        hull = MultiPoint(shp_pts).convex_hull
+        hulls[tourn] = hull
+
+    return route_points_dict, thresholds, hulls
 
 @st.cache_data(show_spinner=False)
 def geocode(address: str):
     """
-    Géocode une adresse via Nominatim :
-      1) on essaye l'adresse brute + " France"
-      2) on essaye l'adresse nettoyée + " France"
-    Gestion du code 429 (backoff exponentiel).
-    Retourne (lat, lon) ou (None, None) en cas d'échec.
+    Géocode via Nominatim (OSM) avec gestion du 429 (backoff).
+    Essaye l’adresse brute puis adresse nettoyée (clean_address).
+    Retourne (lat, lon) ou (None, None).
     """
+    USER_AGENT = "TourneeLocator/1.0 (contact@votredomaine.com)"
+
+    def clean_address(addr2: str) -> str:
+        tokens = addr2.split()
+        cleaned = []
+        prev = None
+        for t in tokens:
+            tl = t.lower().strip(".,")
+            if tl in ("bd", "bld", "boul"):
+                t2 = "boulevard"
+            elif tl in ("av", "av.", "aven"):
+                t2 = "avenue"
+            elif tl in ("res", "res."):
+                t2 = "résidence"
+            else:
+                t2 = t
+            if t2.lower() != prev:
+                cleaned.append(t2)
+                prev = t2.lower()
+        return " ".join(cleaned)
+
     headers = {"User-Agent": USER_AGENT}
     variants = [address, clean_address(address)]
     for var in variants:
@@ -108,159 +204,39 @@ def geocode(address: str):
                 data = resp.json()
                 if data:
                     d0 = data[0]
-                    return float(d0["lat"]), float(d0["lon"])
+                    try:
+                        return float(d0["lat"]), float(d0["lon"])
+                    except Exception:
+                        return None, None
                 time.sleep(1)
                 break
+
             elif resp.status_code == 429:
                 time.sleep(backoff)
                 backoff = min(backoff * 2, 5.0)
                 continue
+
             else:
                 time.sleep(1)
                 break
 
     return None, None
 
-def load_points_from_kmz(kmz_path: str):
-    """
-    Lit un KMZ, extrait le KML et construit un dict de tournées :
-    { 'NomTournée': np.array([[lat, lon], …]), … }.
-
-    Gestion du cas où chaque tournée est dans un sous‐Folder “Autre” :
-    1) Si un <Folder> a des <Placemark> DIRECTS → on l'utilise tel quel.
-    2) Sinon, si ce <Folder> a exactement un sous‐<Folder> qui, LUI, contient
-       des <Placemark> DIRECTS, on rattache ces derniers au nom du dossier parent.
-    3) Sinon, on descend récursivement dans chaque sous‐Folder.
-    """
-    ns = {"kml": "http://www.opengis.net/kml/2.2"}
-
-    with zipfile.ZipFile(kmz_path, "r") as kmz:
-        kml_files = [fn for fn in kmz.namelist() if fn.lower().endswith(".kml")]
-        if not kml_files:
-            raise FileNotFoundError(f"Aucun fichier .kml trouvé dans {kmz_path}")
-        kml_name = kml_files[0]
-        with kmz.open(kml_name, "r") as f:
-            tree = ET.parse(f)
-
-    root = tree.getroot()
-    route_points_dict = {}
-
-    def extrait_placemarks(placemarks):
-        """Retourne [(lat,lon), …] pour une liste d'<Placemark> passée."""
-        pts = []
-        for pm in placemarks:
-            coord_txt = pm.find("kml:Point/kml:coordinates", ns)
-            if coord_txt is None or not coord_txt.text:
-                continue
-            raw = coord_txt.text.strip()
-            parts = raw.split(",")
-            try:
-                lon = float(parts[0]); lat = float(parts[1])
-                pts.append((lat, lon))
-            except ValueError:
-                continue
-        return pts
-
-    def process_folder(folder_elem):
-        """
-        Fonction récursive. Pour un élément <Folder> donné, on fait :
-        1) Si folder_elem a des <Placemark> DIRECTS → on crée une tournée là.
-        2) Sinon, si folder_elem a exactement un sous‐Folder qui possède des <Placemark> DIRECTS,
-           alors on rattache ces placemarks au nom du dossier parent.
-        3) Sinon, on descend dans chacun de ses sous‐Folder (récursion).
-        """
-        placemarks_direct = folder_elem.findall("kml:Placemark", ns)
-        if placemarks_direct:
-            # 1) Cas de placemark direct
-            name_elem = folder_elem.find("kml:name", ns)
-            if name_elem is None or not name_elem.text:
-                return
-            tourn_name = name_elem.text.strip()
-            coords = extrait_placemarks(placemarks_direct)
-            if coords:
-                route_points_dict[tourn_name] = np.array(coords, dtype=float)
-            return
-
-        # 2) Pas de placemark direct → regarder si 1 seul sous‐folder a des placemarks
-        subfolders = folder_elem.findall("kml:Folder", ns)
-        if len(subfolders) == 1:
-            sous = subfolders[0]
-            placemarks_sous = sous.findall("kml:Placemark", ns)
-            if placemarks_sous:
-                name_parent = folder_elem.find("kml:name", ns)
-                if name_parent is None or not name_parent.text:
-                    return
-                tourn_name = name_parent.text.strip()
-                coords = extrait_placemarks(placemarks_sous)
-                if coords:
-                    route_points_dict[tourn_name] = np.array(coords, dtype=float)
-                return
-            # Si ce sous-folder unique n'a pas de placemark direct, on descend dedans
-            process_folder(sous)
-            return
-
-        # 3) Sinon, on descend normalement dans chacun de ses sous‐folders
-        for subf in subfolders:
-            process_folder(subf)
-
-    # On lance la récursion sur TOUS les <Folder> dans le KML (quel que soit le niveau)
-    for folder_root in root.findall(".//kml:Folder", ns):
-        process_folder(folder_root)
-
-    return route_points_dict
-
-@st.cache_data
-def load_tournees_with_nn_thresholds():
-    """
-    Charge les tournées via load_points_from_kmz, puis calcule pour chaque tournée :
-    - convex hull + buffer (HULL_BUFFER_DEGREES)
-    - seuil NN = 90ᵉ percentile des plus petites distances entre points
-    Renvoie 3 dicts : route_points_dict, thresholds_dict, hulls_dict.
-    """
-    route_points_dict = load_points_from_kmz(KMZ_TOURNEES_FILE)
-
-    thresholds_dict = {}
-    hulls_dict = {}
-
-    for name, pts in route_points_dict.items():
-        # (a) nearest-neighbor 90ᵉ percentile
-        if pts.shape[0] <= 1:
-            thresholds_dict[name] = 0.1
-        else:
-            nn_distances = []
-            for i in range(len(pts)):
-                lat_i, lon_i = pts[i, 0], pts[i, 1]
-                dists = distance_haversine_array(lat_i, lon_i, pts[:, 0], pts[:, 1])
-                dists[i] = np.inf
-                nn_distances.append(dists.min())
-            seuil = np.percentile(nn_distances, 90)
-            thresholds_dict[name] = max(seuil, 0.1)
-
-        # (b) convex hull + buffer
-        shapely_pts = [Point(lon, lat) for lat, lon in pts]
-        hull = MultiPoint(shapely_pts).convex_hull
-        hulls_dict[name] = hull.buffer(HULL_BUFFER_DEGREES)
-
-    return route_points_dict, thresholds_dict, hulls_dict
-
 # ------------------------------------------------------------------------------
 #                                FONCTION PRINCIPALE
 # ------------------------------------------------------------------------------
+
 def main():
-    st.title("Attribution Automatique des Tournées PACA (KMZ)")
+    st.title("Attribution Automatique des Tournées PACA")
+    st.write("1) Uploadez votre fichier clients (Adresse, CP, Ville…)\n"
+             "2) L’app géocode puis associe chaque client à la tournée la plus proche\n"
+             "3) Téléchargez le résultat enrichi (.xlsx)")
 
-    st.write(
-        "1) Upload ton fichier clients (Adresse, CP, Ville…)\n"
-        "2) L’app géocode, compare aux tournées du KMZ, et attribue la tournée la plus proche\n"
-        "3) Télécharge le résultat (.xlsx)"
-    )
-
-    # 1) Upload du fichier client
-    uploaded = st.file_uploader("Fichier Excel/CSV", type=["xlsx", "xls", "csv"])
+    uploaded = st.file_uploader("Fichier client (Excel/CSV)", type=["xlsx", "xls", "csv"])
     if not uploaded:
         return
 
-    # 2) Détection de la ligne d’en-tête
+    # 1) Détection de l’en-tête
     raw = pd.read_excel(uploaded, header=None)
     header_idx = 0
     for i, row in raw.iterrows():
@@ -269,141 +245,138 @@ def main():
             header_idx = i
             break
 
-    df = pd.read_excel(uploaded, header=header_idx)
-    st.write("Colonnes détectées dans le fichier client :", list(df.columns))
+    df_clients = pd.read_excel(uploaded, header=header_idx)
+    st.write("Colonnes détectées :", list(df_clients.columns))
 
-    # 3) Choix auto/manu des colonnes Adresse, CP, Ville
-    addr_cols = [
-        c for c in df.columns
-        if any(w in c.lower() for w in ("adresse", "voie", "rue", "route", "chemin"))
-    ]
-    cp_candidates = [c for c in df.columns if "codepostal" in c.lower() or c.lower() == "cp"]
-    ville_candidates = [c for c in df.columns if "ville" in c.lower()]
+    # 2) Détection auto / sélection manuelle des colonnes Adresse, CP, Ville
+    addr_cols = [c for c in df_clients.columns if any(w in c.lower() for w in ("adresse", "voie", "rue", "route", "chemin"))]
+    cp_candidates = [c for c in df_clients.columns if "codepostal" in c.lower() or c.lower() == "cp"]
+    ville_candidates = [c for c in df_clients.columns if "ville" in c.lower()]
 
     if not addr_cols:
-        st.warning("📢 Impossible de détecter automatiquement la colonne ‘Adresse’. Choisissez-la manuellement.")
-        choix_addr = st.selectbox("Quelle colonne contient l’adresse ?", options=list(df.columns))
+        st.warning("Impossible de détecter automatiquement la colonne 'Adresse'. Choisissez-la manuellement.")
+        choix_addr = st.selectbox("Colonne Adresse ?", options=list(df_clients.columns))
         addr_cols = [choix_addr]
 
     if not cp_candidates:
-        st.warning("📢 Impossible de détecter la colonne ‘Code Postal’. Choisissez-la manuellement (ou laissez vide).")
-        cp_candidates = [""] + list(df.columns)
-        choix_cp = st.selectbox("Quelle colonne contient le code postal ? (laisser vide si non présent)", options=cp_candidates)
-        cp_col = choix_cp if choix_cp != "" else None
+        st.warning("Impossible de détecter la colonne 'Code Postal'. Sélectionnez ou laissez vide.")
+        choix_cp = st.selectbox("Colonne Code Postal ? (laisser vide si pas présent)", [None] + list(df_clients.columns))
+        cp_col = choix_cp if choix_cp else None
     else:
         cp_col = cp_candidates[0]
 
     if not ville_candidates:
-        st.warning("📢 Impossible de détecter la colonne ‘Ville’. Choisissez-la manuellement (ou laissez vide).")
-        ville_candidates = [""] + list(df.columns)
-        choix_ville = st.selectbox("Quelle colonne contient la ville ? (laisser vide si non présent)", options=ville_candidates)
-        ville_col = choix_ville if choix_ville != "" else None
+        st.warning("Impossible de détecter la colonne 'Ville'. Sélectionnez ou laissez vide.")
+        choix_ville = st.selectbox("Colonne Ville ? (laisser vide si pas présent)", [None] + list(df_clients.columns))
+        ville_col = choix_ville if choix_ville else None
     else:
         ville_col = ville_candidates[0]
 
     st.write(f"→ Colonnes sélectionnées : Adresse={addr_cols}, CP={cp_col}, Ville={ville_col}")
 
-    # 4) Construction du champ « _full_address »
-    df["_full_address"] = ""
+    # 3) Construction du champ d'adresse complète
+    df_clients["_full_address"] = ""
     for c in addr_cols + ([cp_col] if cp_col else []) + ([ville_col] if ville_col else []):
         if c:
-            df["_full_address"] += df[c].fillna("").astype(str) + " "
-    df["_full_address"] = df["_full_address"].apply(lambda x: unidecode(x.strip()))
+            df_clients["_full_address"] += df_clients[c].fillna("").astype(str) + " "
+    df_clients["_full_address"] = df_clients["_full_address"].str.strip()
 
-    # 5) Géocodage avec barre de progression
-    total = len(df)
+    # 4) Géocodage
+    total = len(df_clients)
     st.write(f"🔍 Géocodage de {total} adresses…")
     progress_geo = st.progress(0)
     lats, lons = [], []
-    for i, addr in enumerate(df["_full_address"]):
+    for i, addr in enumerate(df_clients["_full_address"]):
         lat, lon = geocode(addr)
         lats.append(lat)
         lons.append(lon)
         progress_geo.progress((i + 1) / total)
-    df["Latitude"] = lats
-    df["Longitude"] = lons
+    df_clients["Latitude"] = lats
+    df_clients["Longitude"] = lons
 
-    n_valid = df[["Latitude", "Longitude"]].dropna().shape[0]
+    n_valid = df_clients[["Latitude", "Longitude"]].dropna().shape[0]
     if n_valid == 0:
-        st.error("❌ Aucune adresse n’a été géocodée avec succès ! Vérifiez vos colonnes Adresse/CP/Ville ou la qualité des données.")
+        st.error("❌ Aucune adresse n’a pu être géocodée. Vérifiez les colonnes Adresse/CP/Ville.")
         return
-    st.success(f"✅ Géocodage terminé ({n_valid}/{total} adresses valides)")
+    st.success(f"✅ Géocodage terminé ({n_valid}/{total} adresses valides).")
 
-    # 6) Chargement du KMZ → extraction des tournées + calcul seuils & hulls
-    try:
-        route_points_dict, thresholds_dict, hulls_dict = load_tournees_with_nn_thresholds()
-    except Exception as e:
-        st.error(f"❌ Impossible de charger « {KMZ_TOURNEES_FILE} » ou d’en extraire les tournées :\n{e}")
+    # 5) Chargement des tournées depuis le KML
+    st.write("📂 Extraction des tournées depuis le fichier KML…")
+    KML_TOURNEES_FILE = "abonnes_portes_analyste_tournee.kml"
+    route_points_dict, thresholds_dict, hulls_dict = load_tournees_with_nn_thresholds(KML_TOURNEES_FILE)
+    if route_points_dict is None:
+        st.error("❌ Le KML ne contient aucune tournée valide. Vérifiez la structure (Folder → Placemark).")
         return
 
     n_tournees = len(route_points_dict)
-    st.write(f"📂 {n_tournees} tournées extraites depuis le KMZ.")
-    if n_tournees == 0:
-        st.error("❌ Le KMZ ne contient aucune tournée valide. Vérifiez la structure (Folders avec Placemark).")
-        return
+    st.success(f"🗂 {n_tournees} tournées extraites depuis le KML.")
 
-    st.write("Exemple des tournées (jusqu’à 5) :")
-    idx = 0
-    for rn, pts in route_points_dict.items():
-        st.write(f"   • {rn} → {pts.shape[0]} points")
-        idx += 1
-        if idx >= 5:
-            break
-
-    # 7) Attribution des tournées (buffer et nearest-neighbor)
+    # 6) Attribution des tournées
     st.write("🚚 Attribution des tournées en cours…")
     progress_attr = st.progress(0)
     attribs = []
-
-    for i, row in enumerate(df.itertuples()):
+    for i, row in enumerate(df_clients.itertuples()):
         latc, lonc = getattr(row, "Latitude"), getattr(row, "Longitude")
         if pd.isna(latc) or pd.isna(lonc):
-            attribs.append("")
+            attribs.append("")  # pas de coordonnées
             progress_attr.progress((i + 1) / total)
             continue
 
         pt = Point(lonc, latc)
         choix = ""
-
-        # 7.1) Si le point est DANS un convex hull bufferisé → on attribue cette tournée
-        for route_name, hull_buf in hulls_dict.items():
-            if hull_buf.contains(pt):
-                choix = route_name
+        # 6.1) Recherche par convex hull
+        for tourn_name, hull in hulls_dict.items():
+            if hull.contains(pt):
+                choix = tourn_name
                 break
 
-        # 7.2) Sinon, fallback nearest-neighbor
+        # 6.2) Si pas trouvé, fallback nearest-neighbor
         if choix == "":
-            best_route = ""
+            best_tour = ""
             best_dist = float("inf")
-            for route_name, pts in route_points_dict.items():
-                dists_to_pts = distance_haversine_array(latc, lonc, pts[:, 0], pts[:, 1])
-                dmin = float(dists_to_pts.min())
+            for tourn_name, pts in route_points_dict.items():
+                arr = np.array(pts)
+                dists = np.sqrt((arr[:,0] - latc)**2 + (arr[:,1] - lonc)**2)  # approx en degrés
+                # pour précaution, convertir en km
+                dists_km = np.vectorize(lambda la, lo: haversine_km(latc, lonc, la, lo))(arr[:,0], arr[:,1])
+                dmin = float(dists_km.min())
                 if dmin < best_dist:
                     best_dist = dmin
-                    best_route = route_name
-
-            seuil = thresholds_dict.get(best_route, 0.1) * NN_THRESHOLD_FACTOR
+                    best_tour = tourn_name
+            seuil = thresholds_dict.get(best_tour, 0.0)
             if best_dist <= seuil:
-                choix = best_route
+                choix = best_tour
             else:
                 choix = ""
-
         attribs.append(choix)
         progress_attr.progress((i + 1) / total)
 
-    df["Tournée attribuée"] = attribs
-    st.success("✅ Attribution des tournées terminée")
+    df_clients["Tournée attribuée"] = attribs
+    st.success("✅ Attribution des tournées terminée.")
 
-    # 8) Export final en .xlsx
+    # 7) Export en .xlsx
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False)
+        df_clients.to_excel(writer, index=False)
     st.download_button(
         "📥 Télécharger le fichier enrichi (.xlsx)",
         buffer.getvalue(),
-        file_name="clients_tournees.xlsx",
+        file_name="clients_tournees_enrichi.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
+
+
+def haversine_km(lat1, lon1, lat2, lon2):
+    """
+    Calcule la distance Haversine en kilomètres entre deux points (lat1,lon1) et (lat2,lon2).
+    """
+    R = 6371.0
+    dlat = radians(lat2 - lat1)
+    dlon = radians(lon2 - lon1)
+    a = sin(dlat/2)**2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon/2)**2
+    c = 2 * atan2(sqrt(a), sqrt(1 - a))
+    return R * c
+
 
 if __name__ == "__main__":
     main()
