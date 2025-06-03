@@ -6,7 +6,8 @@ import time
 import io
 import xml.etree.ElementTree as ET
 from math import radians, sin, cos, sqrt, atan2
-from shapely.geometry import Point, MultiPoint
+from shapely.geometry import Point
+from shapely.ops import unary_union
 
 # ---------------------------------------------------------------------------
 #                         FONCTIONS UTILITAIRES
@@ -24,29 +25,45 @@ def strip_ns(tag: str) -> str:
 @st.cache_data(show_spinner=False)
 def load_points_from_kml(kml_path: str) -> dict:
     """
-    Lecture d'un KML non compressé et extraction des tournées.
-    La structure attendue :
+    Lit un fichier KML non compressé et renvoie un dict :
+      { 'NomTournée': np.array([[lat, lon], …]), … }.
+
+    Structure attendue du KML :
       <kml>
         <Document>
-          <Folder>          ← Dépositaire (ex. "MARSEILLE")
-            <name>...</name>
-            <Folder>        ← Tournée (ex. "A001 - ALLAUCH 1")
-              <name>...</name>
-              ... (Plusieurs sous-<Folder> → Placemark)
+          <Folder>           ← Dépositaire (ex. "MARSEILLE")
+            <name>MARSEILLE</name>
+            <Folder>         ← Tournée (ex. "A001 - ALLAUCH 1")
+              <name>A001 - ALLAUCH 1</name>
+              <Folder>       ← Sous-dossier éventuel (ex. "Autre")
+                <Placemark>
+                  <Point><coordinates>lon,lat,alt</coordinates></Point>
+                </Placemark>
+                …
+              </Folder>
+              <Folder>       ← Un autre sous-dossier (“VILLES” / “Campagnes”, etc.)
+                <Placemark>…</Placemark>
+                …
+              </Folder>
             </Folder>
-            <Folder>        ← Autre tournée
-              ...
+            <Folder>         ← Tournée suivante
+              …
             </Folder>
           </Folder>
-          <Folder>          ← Autre Dépositaire
-            ...
+          <Folder>           ← Autre Dépositaire (ex. "AIX")
+            …
           </Folder>
         </Document>
       </kml>
 
-    Pour chaque `<Folder>` de niveau "tournée" (i.e. enfant direct d'un dépositaire),
-    on récupère **tous** ses <Placemark> descendants (dans les sous-sous-dossiers),
-    puis on stocke dans route_points[tournée] = np.array([[lat, lon], ...]).
+    Pour chaque <Folder> de niveau “Tournée” (i.e. enfant direct d’un “Dépositaire”),
+    on récupère tous les <Placemark> descendants (dans tous les sous-<Folder>,
+    quelle que soit leur profondeur). Le nom de la tournée est le contenu de <name>
+    dans le folder parent direct. Retourne :
+      { 'A001 - ALLAUCH 1': np.array([[43.35647, 5.47443], [43.33272, 5.45655], …]),
+        'A002 - ALLAUCH 2': np.array([[…], […], …]),
+        … 
+      }
     """
     tree = ET.parse(kml_path)
     root = tree.getroot()
@@ -58,15 +75,15 @@ def load_points_from_kml(kml_path: str) -> dict:
             doc_elem = child
             break
     if doc_elem is None:
-        # Dans le doute, on prend la racine si pas de Document explicite
+        # Au cas où il n'y a pas de <Document>, on travaille depuis la racine
         doc_elem = root
 
     route_points = {}
 
     def extract_coords_from_placemark(pm_elem):
         """
-        Lit un <Placemark> et renvoie (lat, lon) ou None si problème.
-        On cherche la première balise <coordinates> : "lon,lat,alt"
+        Lit un <Placemark> et renvoie (lat, lon) ou None si on n'a pas réussi à extraire.
+        On cherche la première balise <coordinates> (= "lon,lat,altitude")
         """
         for node in pm_elem.iter():
             if strip_ns(node.tag) == "coordinates" and node.text:
@@ -80,15 +97,17 @@ def load_points_from_kml(kml_path: str) -> dict:
                     return None
         return None
 
-    # Parcours des dépositaire → tournée
+    # 1) Parcours de chaque “dépositaire” (= Folder enfant de <Document>)
     for depos_elem in doc_elem:
         if strip_ns(depos_elem.tag) != "Folder":
             continue
-        # depositeur_name = nom (ex. "MARSEILLE"), pas utilisé directement ici
+
+        # 2) Parcours de chaque “tournée” (= Folder enfant du dépositaire)
         for tourn_elem in depos_elem:
             if strip_ns(tourn_elem.tag) != "Folder":
                 continue
-            # On récupère le <name> du folder "tournée"
+
+            # Lire le <name> du folder “tournée”
             tourn_name = None
             for kid in tourn_elem:
                 if strip_ns(kid.tag) == "name" and kid.text:
@@ -97,7 +116,7 @@ def load_points_from_kml(kml_path: str) -> dict:
             if not tourn_name:
                 continue
 
-            # Récupère tous les Placemark descendants de ce tourn_elem
+            # 3) Récupérer **tous** les Placemark descendants de cette tournée
             coords_list = []
             for pm in tourn_elem.iter():
                 if strip_ns(pm.tag) == "Placemark":
@@ -106,6 +125,7 @@ def load_points_from_kml(kml_path: str) -> dict:
                         coords_list.append(coord)
 
             if coords_list:
+                # On stocke sous forme de numpy array (lat, lon)
                 route_points[tourn_name] = np.array(coords_list, dtype=float)
 
     return route_points
@@ -117,87 +137,103 @@ def load_tournees_with_nn_thresholds(
     default_threshold_km: float = 0.15
 ):
     """
-    Charge les tournées depuis le KML (non compressé) :
+    Charge les tournées depuis un KML (non compressé) :
       - route_points_dict : { 'NomTournée': np.array([[lat,lon], ...]), ... }
       - thresholds_dict   : { 'NomTournée': seuil_km, ... }
-      - hulls_dict        : { 'NomTournée': convex_hull (Shapely), ... }
+      - polygons_dict     : { 'NomTournée': shapely Polygon (ou MultiPolygon), ... }
 
-    Seuil calculé comme médiane des distances NN × 2 ou minimum default_threshold_km.
+    Pour chaque tournée :
+      1) On extrait son nuage de points (lat, lon).
+      2) On calcule la distance “nearest‐neighbor” (NN) de chaque point à son plus proche
+         voisin (dans la même tournée) → on stocke dans df_ref["NN_dist_km"].
+      3) Seuil = max(médiane(NN_dist_km) × 2, default_threshold_km).
+      4) Pour tracer un “corridor”, on crée un buffer (rayon = seuil/111 degrés) autour
+         de CHAQUE point, puis on fait l’union de tous ces buffers → on obtient un
+         polygone (ou un ou plusieurs polygones) englobant exactement les points (en
+         respectant la forme en U ou en couloir étroit).
+    Retourne (route_points_dict, thresholds_dict, polygons_dict).
     """
     route_points_dict = load_points_from_kml(kml_file)
     if not route_points_dict:
         return None, None, None
 
-    # Construire un DataFrame plat pour calcul des plus proches voisins
+    # 1) Construire un DataFrame “plat” pour calculer les plus proches voisins
     rows = []
     for tourn_name, pts in route_points_dict.items():
-        for lat, lon in pts:
+        for (lat, lon) in pts:
             rows.append({"Tournée": tourn_name, "Latitude": lat, "Longitude": lon})
     df_ref = pd.DataFrame(rows)
 
-    # Calcul manuel des plus proches voisins (sans sklearn)
-    # Pour chaque point, on calcule la distance haversine à tous les autres de la même tournée,
-    # on prend la plus petite NON nulle → c'est la distance au "véritable" NN.
+    # 2) Pour chaque point de chaque tournée, calculer sa distance Haversine
+    #    vers tous les autres points de la même tournée et retenir la plus petite (> 0).
+    def haversine_array(lat1, lon1, lat2_arr, lon2_arr):
+        """
+        Pour un point (lat1,lon1) et un array de points lat2_arr,lon2_arr,
+        calcule la distance haversine vers chacun, retourne un array de distances en km.
+        """
+        lat1r = radians(lat1)
+        lon1r = radians(lon1)
+        lat2r = np.radians(lat2_arr)
+        lon2r = np.radians(lon2_arr)
+        dlat = lat2r - lat1r
+        dlon = lon2r - lon1r
+        a = np.sin(dlat / 2) ** 2 + np.cos(lat1r) * np.cos(lat2r) * np.sin(dlon / 2) ** 2
+        c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
+        return 6371.0 * c  # rayon de la Terre ≃ 6371 km
+
     nn_distances = []
     for tourn_name, grp in df_ref.groupby("Tournée"):
-        # Extraire les lat/lon de cette tournée
         latitudes = grp["Latitude"].values
         longitudes = grp["Longitude"].values
-        n = len(latitudes)
-        if n <= 1:
-            # Si un seul point, on considère NN = infinite
-            nn_distances.extend([np.inf] * n)
+        n_pts = len(latitudes)
+        if n_pts <= 1:
+            # Si une seule coordonnée dans la tournée, pas de voisin, on met inf
+            nn_distances.extend([np.inf] * n_pts)
             continue
 
-        # Calcul pairwise distances pour cette tournée
-        # On va calculer la matrice NxN des distances Haversine
-        arr_lats = latitudes.reshape((n, 1))
-        arr_lons = longitudes.reshape((n, 1))
-
-        # Fonction pour appliquer haversine sur vecteurs
-        def haversine_array(lat1, lon1, lat2arr, lon2arr):
-            # lat1, lon1 scalaires, lat2arr, lon2arr vecteurs
-            dlat = np.radians(lat2arr - lat1)
-            dlon = np.radians(lon2arr - lon1)
-            a = np.sin(dlat / 2) ** 2 + np.cos(np.radians(lat1)) * \
-                np.cos(np.radians(lat2arr)) * np.sin(dlon / 2) ** 2
-            c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
-            return 6371.0 * c  # rayon terre en km
-
-        # Pour chaque i, calculer distance au plus proche autre point j != i
-        for i in range(n):
+        # Pour chaque point i, calculer distance à tous les points j (y compris soi-même)
+        for i in range(n_pts):
             lat_i = latitudes[i]
             lon_i = longitudes[i]
-            # calcul à toute la liste
             dists = haversine_array(lat_i, lon_i, latitudes, longitudes)
-            dists[i] = np.inf  # ignorer soi-même
+            dists[i] = np.inf  # ignorer la distance à soi-même
             nn_distances.append(dists.min())
 
-    # On fixe la colonne NN_dist_km
     df_ref["NN_dist_km"] = nn_distances
 
-    # Calcul des seuils et des convex hulls
+    # 3) Calculer seuils et construire les “corridors” (buffer union)
     thresholds = {}
-    hulls = {}
+    polygons = {}
     for tourn_name, grp in df_ref.groupby("Tournée"):
         median_nn = grp["NN_dist_km"].replace(np.inf, 0).median()
         seuil = float(max(median_nn * 2, default_threshold_km))
         thresholds[tourn_name] = seuil
 
-        # Construire un convex hull shapely
+        # 4) Créer un “corridor” autour des points : buffer de rayon (seuil km) converti en degrés
         pts = route_points_dict[tourn_name]
-        shapely_pts = [Point(lon, lat) for lat, lon in pts]
-        hull = MultiPoint(shapely_pts).convex_hull
-        hulls[tourn_name] = hull
+        # conversion km → degrés approximative : 1° ≃ 111 km
+        radius_degrees = seuil / 111.0
 
-    return route_points_dict, thresholds, hulls
+        # Créer un buffer sur chaque point (lon, lat)
+        point_buffers = []
+        for (lat, lon) in pts:
+            shp_pt = Point(lon, lat)  # shapely Point prend (x=lon, y=lat)
+            circ = shp_pt.buffer(radius_degrees)  # buffer en degrés
+            point_buffers.append(circ)
+
+        # Union de tous ces cercles → un ou plusieurs polygones collés aux points
+        union_poly = unary_union(point_buffers)
+        polygons[tourn_name] = union_poly
+
+    return route_points_dict, thresholds, polygons
 
 
 @st.cache_data(show_spinner=False)
 def geocode(address: str):
     """
-    Géocode via Nominatim (OSM) avec backoff en cas d'erreur 429.
-    On teste d'abord l'adresse brute, puis l'adresse "nettoyée".
+    Géocode une adresse via Nominatim (OpenStreetMap),
+    avec backoff si on reçoit un statut 429 (trop de requêtes).
+    On teste d'abord l'adresse brute, puis une version “nettoyée”.
     """
     USER_AGENT = "TourneeLocator/1.0 (contact@votredomaine.com)"
 
@@ -250,7 +286,7 @@ def geocode(address: str):
                 break
 
             elif resp.status_code == 429:
-                # Trop de requêtes : on attend un peu puis on réessaye (jusqu'à 5 secondes)
+                # Trop de requêtes : on attend puis on réessaie jusqu'à 5 s
                 time.sleep(backoff)
                 backoff = min(backoff * 2, 5.0)
                 continue
@@ -286,12 +322,12 @@ def main():
     3) Téléchargez le résultat enrichi (.xlsx)  
     """)
 
-    # ------------- Uploader le fichier "clients" -----------------
+    # --- 1) Uploader le fichier client (Excel ou CSV) ---
     uploaded = st.file_uploader("Fichier client (Excel/CSV)", type=["xlsx", "xls", "csv"])
     if not uploaded:
         return
 
-    # 1) Scanner l'en-tête pour trouver la première ligne où apparaissent "adresse", "CP", "ville"
+    # 2) Détecter la ligne d'en-tête (celle qui contient “Adresse”, “CP” ou “Ville”)
     raw = pd.read_excel(uploaded, header=None)
     header_idx = 0
     for i, row in raw.iterrows():
@@ -303,7 +339,7 @@ def main():
     df_clients = pd.read_excel(uploaded, header=header_idx)
     st.write("Colonnes détectées :", list(df_clients.columns))
 
-    # 2) Détection automatique des colonnes "Adresse", "Code postal", "Ville"
+    # 3) Détection automatique des colonnes “Adresse”, “Code Postal”, “Ville”
     addr_cols = [c for c in df_clients.columns if any(w in c.lower() for w in ("adresse", "voie", "rue", "route", "chemin"))]
     cp_candidates = [c for c in df_clients.columns if "codepostal" in c.lower() or c.lower() == "cp"]
     ville_candidates = [c for c in df_clients.columns if "ville" in c.lower()]
@@ -314,14 +350,14 @@ def main():
         addr_cols = [choix_addr]
 
     if not cp_candidates:
-        st.warning("Impossible de détecter la colonne 'Code Postal'. Sélectionnez ou laissez vide.")
+        st.warning("Impossible de détecter la colonne 'Code Postal'. Sélectionnez-la ou laissez vide.")
         choix_cp = st.selectbox("Colonne Code Postal ? (laisser vide si pas présent)", [None] + list(df_clients.columns))
         cp_col = choix_cp if choix_cp else None
     else:
         cp_col = cp_candidates[0]
 
     if not ville_candidates:
-        st.warning("Impossible de détecter la colonne 'Ville'. Sélectionnez ou laissez vide.")
+        st.warning("Impossible de détecter la colonne 'Ville'. Sélectionnez-la ou laissez vide.")
         choix_ville = st.selectbox("Colonne Ville ? (laisser vide si pas présent)", [None] + list(df_clients.columns))
         ville_col = choix_ville if choix_ville else None
     else:
@@ -329,14 +365,14 @@ def main():
 
     st.write(f"→ Colonnes sélectionnées : Adresse={addr_cols}, CP={cp_col}, Ville={ville_col}")
 
-    # 3) Construction du champ d'adresse complète
+    # 4) Construction d'une seule colonne “_full_address” (concaténation Adresse + CP + Ville)
     df_clients["_full_address"] = ""
     for c in addr_cols + ([cp_col] if cp_col else []) + ([ville_col] if ville_col else []):
         if c:
             df_clients["_full_address"] += df_clients[c].fillna("").astype(str) + " "
     df_clients["_full_address"] = df_clients["_full_address"].str.strip()
 
-    # 4) Géocodage
+    # 5) Géocodage en série
     total = len(df_clients)
     st.write(f"🔍 Géocodage de {total} adresses…")
     progress_geo = st.progress(0)
@@ -351,14 +387,14 @@ def main():
 
     n_valid = df_clients[["Latitude", "Longitude"]].dropna().shape[0]
     if n_valid == 0:
-        st.error("❌ Aucune adresse n’a pu être géocodée. Vérifiez les colonnes Adresse/CP/Ville.")
+        st.error("❌ Aucune adresse n’a pu être géocodée. Vérifiez vos colonnes Adresse/CP/Ville.")
         return
-    st.success(f"✅ Géocodage terminé ({n_valid}/{total} adresses valides).")
+    st.success(f"✅ Géocodage terminé : {n_valid}/{total} adresses valides.")
 
-    # 5) Chargement des tournées depuis le KML
+    # 6) Chargement des tournées depuis le KML
     st.write("📂 Extraction des tournées depuis le fichier KML…")
     KML_TOURNEES_FILE = "abonnes_portes_analyste_tournee.kml"
-    route_points_dict, thresholds_dict, hulls_dict = load_tournees_with_nn_thresholds(KML_TOURNEES_FILE)
+    route_points_dict, thresholds_dict, polygons_dict = load_tournees_with_nn_thresholds(KML_TOURNEES_FILE)
     if route_points_dict is None:
         st.error("❌ Le KML ne contient aucune tournée valide. Vérifiez la structure (Folder → Placemark).")
         return
@@ -366,34 +402,36 @@ def main():
     n_tournees = len(route_points_dict)
     st.success(f"🗂 {n_tournees} tournées extraites depuis le KML.")
 
-    # 6) Attribution des tournées
+    # 7) Attribution des tournées aux clients
     st.write("🚚 Attribution des tournées en cours…")
     progress_attr = st.progress(0)
     attribs = []
+
     for i, row in enumerate(df_clients.itertuples()):
         latc = getattr(row, "Latitude")
         lonc = getattr(row, "Longitude")
         if pd.isna(latc) or pd.isna(lonc):
-            attribs.append("")  # pas de coordonnées
+            attribs.append("")  # pas de coordonnées, on laisse vide
             progress_attr.progress((i + 1) / total)
             continue
 
         pt = Point(lonc, latc)
         choix = ""
 
-        # 6.1) Recherche par convex hull
-        for tourn_name, hull in hulls_dict.items():
-            if hull.contains(pt):
+        # 7.1) Vérifier si le point se trouve DANS le “corridor” (polygon) de l'une des tournées
+        for tourn_name, poly in polygons_dict.items():
+            if poly.contains(pt):
                 choix = tourn_name
                 break
 
-        # 6.2) Si pas trouvé via hull, fallback nearest-neighbor
+        # 7.2) Si aucune tournée n’a “contenu” ce point, on fait nearest‐neighbor
         if choix == "":
             best_tour = ""
             best_dist = float("inf")
+
             for tourn_name, pts in route_points_dict.items():
-                arr = np.array(pts)
-                # calcul des distances "haversine" en km vers TOUS points de la tournée
+                arr = np.array(pts)  # shape (N,2) avec (lat, lon)
+                # Calcul vectorisé Haversine (latc,lonc) → tous les points de la tournée
                 dists = np.vectorize(lambda la, lo: haversine_km(latc, lonc, la, lo))(arr[:,0], arr[:,1])
                 dmin = float(dists.min())
                 if dmin < best_dist:
@@ -404,7 +442,7 @@ def main():
             if best_dist <= seuil:
                 choix = best_tour
             else:
-                choix = ""
+                choix = ""  # assez loin, on ne l'attribue à aucune tournée
 
         attribs.append(choix)
         progress_attr.progress((i + 1) / total)
@@ -412,7 +450,7 @@ def main():
     df_clients["Tournée attribuée"] = attribs
     st.success("✅ Attribution des tournées terminée.")
 
-    # 7) Export en .xlsx
+    # 8) Export du fichier enrichi en .xlsx
     buffer = io.BytesIO()
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
         df_clients.to_excel(writer, index=False)
