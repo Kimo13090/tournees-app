@@ -432,6 +432,9 @@ def main():
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
 
+    # === Mention de paternité ===
+    st.markdown("<hr/>", unsafe_allow_html=True)
+    st.caption("Made by Delestret Kim")
 
 if __name__ == "__main__":
     main()
