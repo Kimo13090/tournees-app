@@ -4,4 +4,4 @@ numpy
 requests
 shapely
 openpyxl
-xlrd==2.0.1
+
