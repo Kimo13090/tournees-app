@@ -366,7 +366,7 @@ def main():
 
     # 8) Charger les tournées depuis le KML
     st.write("📂 Extraction des tournées depuis le fichier KML…")
-    KML_TOURNEES_FILE = "testoabonnes_portes_analyste_tournee - Copie.kml"
+    KML_TOURNEES_FILE = "oficielabonnes_portes_analyste_tournee.kml"
     route_points_dict, thresholds_dict, polygons_dict = load_tournees_with_nn_thresholds(KML_TOURNEES_FILE)
     if route_points_dict is None:
         st.error("❌ Le KML ne contient aucune tournée valide. Vérifiez la structure (Folder → Placemark).")
